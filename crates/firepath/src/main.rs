@@ -1,0 +1,3 @@
+//! firepath CLI
+
+fn main() {}
