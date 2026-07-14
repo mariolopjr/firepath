@@ -1,3 +1,5 @@
+# Pinned to nightly because branch coverage (cargo llvm-cov --branch) relies on
+# nightly-only coverage instrumentation
 [toolchain]
 channel = "nightly-2026-07-14"
 components = ["rustfmt", "clippy", "rust-src", "llvm-tools-preview"]

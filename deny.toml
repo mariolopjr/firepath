@@ -1,0 +1,29 @@
+# cargo-deny configuration
+# https://embarkstudios.github.io/cargo-deny
+
+# Fail on crates with a known RUSTSEC advisory
+[advisories]
+ignore = []
+
+# Only these licenses are allowed
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+]
+confidence-threshold = 0.8
+
+# Reject duplicate crate versions and wildcard version requirements
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+
+# Crates must come from crates.io, reject other registries and git sources
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
