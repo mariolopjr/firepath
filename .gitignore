@@ -4,6 +4,10 @@
 
 .DS_Store
 
+# Coverage reports, the directory itself stays so editors always have a target
+/coverage/*
+!/coverage/.gitkeep
+
 # Personal ledger journals must never be committed
 *.ledger
 *.journal

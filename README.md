@@ -1,5 +1,8 @@
 # firepath - FIRE budgeting, planning, and retirement tool using ledger files
 
+[![Build](https://img.shields.io/github/actions/workflow/status/mariolopjr/firepath/ci.yml?branch=main&style=for-the-badge)](https://github.com/mariolopjr/firepath/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/codecov/c/github/mariolopjr/firepath/main?style=for-the-badge)](https://codecov.io/gh/mariolopjr/firepath)
+
 firepath reads a native [ledger][ledger] journal and turns it into tax-aware retirement analysis: deterministic
 projection, [Monte Carlo][monte-carlo], [historical backtest][backtest], [Roth conversion][roth]
 planning, and drawdown that models [RMD][rmd], [IRMAA][irmaa], and [NIIT][niit]. Results are presented
