@@ -11,3 +11,6 @@
 # Personal ledger journals must never be committed
 *.ledger
 *.journal
+
+# The ledger fixtures are generated on demand from the committed manifest
+/data/fixtures/

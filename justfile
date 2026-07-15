@@ -16,6 +16,11 @@ fmt:
 lint:
   cargo clippy --workspace --all-targets -- -D warnings
 
+# Generate the ledger fixtures and verify them against the pinned hashes
+# Pass --pin to record new hashes after an output change
+gen-fixtures *args:
+  cargo run --quiet --package firepath-fixtures --bin gen-fixtures -- {{ args }}
+
 # Audit dependencies for advisories, licenses, duplicates, and sources
 deny:
   cargo deny check
@@ -34,3 +39,4 @@ check:
   cargo clippy --workspace --all-targets -- -D warnings
   cargo test --workspace --all-targets
   cargo build --workspace --all-targets
+  cargo run --quiet --package firepath-fixtures --bin gen-fixtures

@@ -1,0 +1,7 @@
+schema_version = 1
+seed = 42
+window_start = "2015-01-01"
+window_end = "2024-12-31"
+
+[hashes]
+"main.ledger" = "5cc4d623134359f8ec6837c921e229ec56f89caa421a4a316aedc2a86f0e1db6"

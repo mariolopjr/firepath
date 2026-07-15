@@ -1,0 +1,22 @@
+[package]
+name = "firepath-fixtures"
+version.workspace = true
+description = "Deterministic ledger fixtures generator for firepath tests"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Name the bin the same as the command so that `cargo run --bin gen-fixtures`
+# and `just gen-fixtures` can be the same
+[[bin]]
+name = "gen-fixtures"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+serde.workspace = true
+sha2.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true
