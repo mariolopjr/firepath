@@ -16,6 +16,7 @@ Code Conventions
 * Edition 2024, rustfmt defaults, clippy with -D warnings
 * Money is Decimal in the ledger layer and f64 only inside the projection engines. Amounts cross
   that boundary once on the way in only
+* Coverage (`just coverage`, cargo-llvm-cov on nightly) instruments every crate, so test code counts unless excluded. A crate root with in-file `#[cfg(test)]` modules declares `#![cfg_attr(coverage_nightly, feature(coverage_attribute))]` once and tags each test module `#[cfg_attr(coverage_nightly, coverage(off))]`, which cascades to every test in it
 * The web dashboard is read-only. The journal is written only through the LSP and the CLI
 * Sum money in deterministic order
 * The journal states what a transaction is

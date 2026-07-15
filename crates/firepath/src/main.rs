@@ -1,28 +1,34 @@
 //! firepath CLI
+//!
+//! For now the only thing supported is `--help` and `--version`
 
-/// Sum two operands, returning `None` when the result would overflow
-pub fn add(left: u64, right: u64) -> Option<u64> {
-    left.checked_add(right)
-}
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
+use clap::Parser;
+
+/// FIRE budgeting, planning, and retirement tool driven by ledger journals
+///
+/// `version` reads the package version which is inherited from the workspace
+/// `about` uses the first line of this comment
+#[derive(Debug, Parser)]
+#[command(version, about, long_about = None)]
+struct Cli {}
 
 fn main() {
-    match add(2, 2) {
-        Some(sum) => println!("2 + 2 = {sum}"),
-        None => eprintln!("addition overflowed"),
-    }
+    // `parse` handles `--help` and `--version` by printing and exiting
+    Cli::parse();
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::add;
+    use super::Cli;
+    use clap::CommandFactory;
 
+    // Catches structural mistakes in the derived command (overlapping flags,
+    // bad defaults)
     #[test]
-    fn sums_two_operands() {
-        assert_eq!(add(2, 2), Some(4));
-    }
-
-    #[test]
-    fn reports_overflow_instead_of_wrapping() {
-        assert_eq!(add(u64::MAX, 1), None);
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
     }
 }

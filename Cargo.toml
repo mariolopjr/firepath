@@ -3,13 +3,21 @@ resolver = "3"
 members = ["crates/firepath"]
 
 [workspace.package]
+version = "0.1.0"
 edition = "2024"
 license = "MIT"
 authors = ["Mario Lopez"]
 
 [workspace.dependencies]
+clap = { version = "4.5", features = ["derive"] }
 
 [workspace.lints.rust]
+# coverage and coverage_nightly are injected by cargo-llvm-cov, not by cargo,
+# so declare them or unexpected_cfgs fails the -D warnings clippy step
+unexpected_cfgs = { level = "warn", check-cfg = [
+  'cfg(coverage)',
+  'cfg(coverage_nightly)',
+] }
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"
 missing_docs = "warn"

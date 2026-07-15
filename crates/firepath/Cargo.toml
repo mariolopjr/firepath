@@ -1,12 +1,13 @@
 [package]
 name = "firepath"
-version = "0.1.0"
+version.workspace = true
 description = "FIRE budgeting, planning, and retirement tool driven by ledger journals"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
 [dependencies]
+clap.workspace = true
 
 [lints]
 workspace = true
