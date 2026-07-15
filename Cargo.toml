@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/firepath", "crates/fixtures"]
+members = ["crates/firepath", "crates/fixtures", "crates/ledger"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,6 +10,7 @@ authors = ["Mario Lopez"]
 
 [workspace.dependencies]
 clap = { version = "4.5", features = ["derive"] }
+memchr = "2.8"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 toml = "0.8"
