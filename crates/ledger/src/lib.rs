@@ -1,15 +1,21 @@
 //! `firepath-ledger`: the parser for the ledger journal grammar
 //!
-//! This scaffold lands the types the rest of the parser is built on: source
+//! The scaffold lands the types the rest of the parser is built on: source
 //! spans and file handles ([`Span`], [`FileId`]), parse errors that render as
 //! `file:line:col` through a [`LineIndex`] ([`ParseError`]), and the per-file
-//! result container ([`Parsed`])
+//! result container ([`Parsed`]).
+//!
+//! On top of that sits the first scanner: [`Amount`], a [`Commodity`] and an
+//! exact `Decimal` quantity, with the [`Placement`] and [`DecimalStyle`] that
+//! let it format back to the shape it was read from
 
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+mod amount;
 mod error;
 mod span;
 
+pub use amount::{Amount, Commodity, DecimalStyle, Placement};
 pub use error::{LineCol, LineIndex, ParseError};
 pub use span::{FileId, Span};
 

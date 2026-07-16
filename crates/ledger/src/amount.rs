@@ -1,0 +1,788 @@
+//! Amount scanning: a quantity paired with its commodity
+//!
+//! An amount is a decimal quantity and the commodity it is denominated in. The
+//! commodity is written on either side of the number: a prefix (`$5`) or a
+//! suffix (`5 VTI`). A suffix commodity that holds spaces or other characters
+//! that would otherwise end the symbol is quoted (`"MUTF: VFIAX"`).
+//!
+//! The quantity is [`rust_decimal::Decimal`] so money stays exact through the
+//! whole ledger layer, f64 only appears later inside the projection engines.
+//! Decimal preserves scale, so `$5.00` keeps its two fractional digits and
+//! formats back with them.
+
+use crate::error::ParseError;
+use crate::span::Span;
+use rust_decimal::Decimal;
+use std::fmt;
+
+/// Which side of the number the commodity is written on
+///
+/// Stored on the parsed amount so formatting can put the commodity back on the
+/// side it came from, ensuring roundtripping
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// Commodity before the number, `$5`
+    Prefix,
+    /// Commodity after the number, `5 VTI`
+    Suffix,
+}
+
+/// Which character marks the decimal point, the other of `.` and `,` being the
+/// thousands separator
+///
+/// [`Period`](DecimalStyle::Period) is the American style, a period decimal and
+/// comma thousands (`1,000.50`). [`Comma`](DecimalStyle::Comma) is the European
+/// style with the two flipped (`1.000,50`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecimalStyle {
+    /// Period decimal, comma thousands: `1,000.50`
+    Period,
+    /// Comma decimal, period thousands: `1.000,50`
+    Comma,
+}
+
+impl DecimalStyle {
+    /// The `(thousands separator, decimal mark)` bytes for this style
+    fn marks(self) -> (u8, u8) {
+        match self {
+            Self::Period => (b',', b'.'),
+            Self::Comma => (b'.', b','),
+        }
+    }
+}
+
+/// A commodity symbol together with the side it sits on
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Commodity {
+    // The symbol with any surrounding quotes stripped. Quoting is recomputed
+    // from the content when formatting, so an input that quotes a symbol
+    // needing no quotes still round-trips to an equal value
+    symbol: String,
+    placement: Placement,
+}
+
+impl Commodity {
+    /// A commodity with the given symbol and placement
+    ///
+    /// The symbol must hold no `"` and no ASCII control byte: a quote has no
+    /// escape in the grammar and a control byte would corrupt the single-line
+    /// journal, so either would keep the commodity from formatting back to
+    /// itself
+    pub fn new(symbol: impl Into<String>, placement: Placement) -> Self {
+        let symbol = symbol.into();
+        debug_assert!(
+            symbol_round_trips(&symbol),
+            "commodity symbol must not hold a quote or control byte: {symbol:?}"
+        );
+        Self { symbol, placement }
+    }
+
+    /// The symbol text, without surrounding quotes
+    pub fn symbol(&self) -> &str {
+        &self.symbol
+    }
+
+    /// Which side of the number the commodity sits on
+    pub fn placement(&self) -> Placement {
+        self.placement
+    }
+}
+
+impl fmt::Display for Commodity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Quote only when the bare symbol would not scan back as one token: an
+        // empty symbol, or one holding whitespace, a digit, or a character that
+        // ends an unquoted symbol
+        if needs_quotes(&self.symbol) {
+            write!(f, "\"{}\"", self.symbol)
+        } else {
+            f.write_str(&self.symbol)
+        }
+    }
+}
+
+/// A quantity paired with its commodity
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Amount {
+    /// The signed quantity, exact and scale-preserving
+    pub quantity: Decimal,
+    /// The commodity the quantity is denominated in
+    pub commodity: Commodity,
+    /// The decimal style the amount was read in, used to format it back
+    pub style: DecimalStyle,
+}
+
+impl Amount {
+    /// Scan one amount from `src` in the American period style (period decimal,
+    /// comma thousands), which must hold exactly the amount and nothing else
+    ///
+    /// This is [`parse_styled`](Amount::parse_styled) with [`DecimalStyle::Period`].
+    /// Use `parse_styled` with [`DecimalStyle::Comma`] for European `1.000,50`
+    ///
+    /// # Errors
+    /// See [`parse_styled`](Amount::parse_styled)
+    pub fn parse(src: &str) -> Result<Self, ParseError> {
+        Self::parse_styled(src, DecimalStyle::Period)
+    }
+
+    /// Scan one amount from `src` in `style`, which must hold exactly the amount
+    /// and nothing else
+    ///
+    /// `style` fixes which of `.` and `,` is the decimal mark and which is the
+    /// thousands separator. The same digits parse to different amounts under
+    /// each style, so the caller chooses it, and it is kept on the result so the
+    /// amount formats back in it.
+    ///
+    /// The input is the whole amount, not a prefix of a larger line: leading and
+    /// trailing whitespace and any characters past the amount are errors, not
+    /// trimmed or ignored. A caller scanning an amount out of a line trims the
+    /// slice to the amount first
+    ///
+    /// # Errors
+    /// The span is a byte range into `src`. Errors: leading or trailing
+    /// whitespace, an unterminated quoted commodity, a control byte inside a
+    /// quoted commodity, a missing number or commodity, more than one sign,
+    /// malformed thousands grouping, a quantity too large or too precise for
+    /// [`Decimal`], or characters left over after the amount
+    pub fn parse_styled(src: &str, style: DecimalStyle) -> Result<Self, ParseError> {
+        let mut s = Scanner::new(src);
+        let (_, decimal) = style.marks();
+
+        // The input is exactly the amount, so leading whitespace is malformed.
+        // Catch it here for a clear message instead of failing later as a
+        // missing commodity or number
+        if matches!(s.peek(), Some(b' ' | b'\t')) {
+            let start = s.pos;
+            s.skip_spaces();
+            return Err(ParseError::new(
+                "leading whitespace before the amount",
+                s.span_from(start),
+            ));
+        }
+
+        // A leading sign binds to the number no matter which side the commodity
+        // is on, and only one sign is allowed in the whole amount
+        let mut negative = false;
+        let mut sign_seen = false;
+        if let Some(neg) = s.take_sign() {
+            negative = neg;
+            sign_seen = true;
+        }
+
+        let (quantity, commodity) = match s.peek() {
+            // A digit or the decimal mark next means the number leads and the
+            // commodity, if any, follows it: `5 VTI`
+            Some(b) if is_number_start(b, decimal) => {
+                let quantity = s.take_number(negative, style)?;
+                s.skip_spaces();
+                let symbol = s.take_commodity()?;
+                (quantity, Commodity::new(symbol, Placement::Suffix))
+            }
+            // Anything else that is not end-of-input starts a prefix commodity:
+            // `$5`, and a sign may sit between commodity and number: `$-5`
+            Some(_) => {
+                let symbol = s.take_commodity()?;
+                s.skip_spaces();
+                // A sign may sit between the commodity and the number, `$-5`, but
+                // only if the amount did not already lead with one
+                let sign_pos = s.pos;
+                if let Some(neg) = s.take_sign() {
+                    if sign_seen {
+                        return Err(ParseError::new(
+                            "amount has more than one sign",
+                            s.span_from(sign_pos),
+                        ));
+                    }
+                    negative = neg;
+                }
+                let quantity = s.take_number(negative, style)?;
+                (quantity, Commodity::new(symbol, Placement::Prefix))
+            }
+            None => return Err(ParseError::new("expected an amount", s.rest_from(0))),
+        };
+
+        if !s.at_end() {
+            // Trailing whitespace is a clearer, distinct failure from arbitrary
+            // leftover characters, since the input is meant to be only the amount
+            let message = if s.rest_is_whitespace() {
+                "trailing whitespace after the amount"
+            } else {
+                "unexpected characters after the amount"
+            };
+            return Err(ParseError::new(message, s.rest_from(s.pos)));
+        }
+        Ok(Self {
+            quantity,
+            commodity,
+            style,
+        })
+    }
+}
+
+impl fmt::Display for Amount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The sign lives in the number, so a negative prefix amount prints as
+        // `$-5.00`, which scans back to the same value. The canonical form drops
+        // thousands grouping, so the comma style differs only in swapping the one
+        // decimal dot for a comma
+        match self.style {
+            DecimalStyle::Period => match self.commodity.placement {
+                Placement::Prefix => write!(f, "{}{}", self.commodity, self.quantity),
+                Placement::Suffix => write!(f, "{} {}", self.quantity, self.commodity),
+            },
+            DecimalStyle::Comma => {
+                let number = self.quantity.to_string().replace('.', ",");
+                match self.commodity.placement {
+                    Placement::Prefix => write!(f, "{}{number}", self.commodity),
+                    Placement::Suffix => write!(f, "{number} {}", self.commodity),
+                }
+            }
+        }
+    }
+}
+
+/// A byte cursor over the amount source
+struct Scanner<'a> {
+    src: &'a str,
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Scanner<'a> {
+    fn new(src: &'a str) -> Self {
+        Self {
+            src,
+            bytes: src.as_bytes(),
+            pos: 0,
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn bump(&mut self) {
+        self.pos = self.pos.saturating_add(1);
+    }
+
+    fn at_end(&self) -> bool {
+        self.pos >= self.bytes.len()
+    }
+
+    /// Whether every byte from the cursor to the end is a space or tab
+    fn rest_is_whitespace(&self) -> bool {
+        self.bytes
+            .get(self.pos..)
+            .unwrap_or_default()
+            .iter()
+            .all(|&b| matches!(b, b' ' | b'\t'))
+    }
+
+    fn skip_spaces(&mut self) {
+        // Amounts live on one line, so only spaces and tabs separate the parts
+        while matches!(self.peek(), Some(b' ' | b'\t')) {
+            self.bump();
+        }
+    }
+
+    /// Take an optional leading sign, `true` for negative
+    fn take_sign(&mut self) -> Option<bool> {
+        match self.peek() {
+            Some(b'-') => {
+                self.bump();
+                Some(true)
+            }
+            Some(b'+') => {
+                self.bump();
+                Some(false)
+            }
+            _ => None,
+        }
+    }
+
+    /// Scan the integer part with its thousands separators, an optional
+    /// fraction, and the sign into a [`Decimal`], reading `style` for which byte
+    /// is the decimal mark and which is the thousands separator
+    ///
+    /// The thousands separator groups the integer part only: the group before
+    /// the first one is one to three digits and not all zeros, and every group
+    /// after it is exactly three digits. The decimal mark is the sole decimal,
+    /// so a separator that does not fit the grouping is malformed, not the other
+    /// mark: under the period style `1,00`, `0,075`, and `5,` are errors, and
+    /// under the comma style `1.00`, `0.075`, and `5.` are errors as well
+    fn take_number(&mut self, negative: bool, style: DecimalStyle) -> Result<Decimal, ParseError> {
+        let (thousands, decimal) = style.marks();
+        let start = self.pos;
+        // Build the clean string decimal wants: sign, digits, dot, fraction. The
+        // thousands separators carry no value and are dropped once their
+        // placement checks out, and the decimal mark is always written as a dot
+        let mut text = String::new();
+        if negative {
+            text.push('-');
+        }
+        let mut has_digit = false;
+        // Validate the grouping while scanning the integer part. group_len counts
+        // digits in the open group, group_closed marks that a group has closed,
+        // and first_group_all_zeros guards the `0,075` shape
+        let mut group_len = 0u32;
+        let mut group_closed = false;
+        let mut first_group_all_zeros = true;
+        while let Some(b) = self.peek() {
+            if b.is_ascii_digit() {
+                text.push(char::from(b));
+                has_digit = true;
+                group_len = group_len.saturating_add(1);
+                if !group_closed && b != b'0' {
+                    first_group_all_zeros = false;
+                }
+                self.bump();
+            } else if b == thousands {
+                if group_closed {
+                    // A group after the first must be exactly three digits
+                    if group_len != 3 {
+                        return Err(ParseError::new(
+                            "thousands groups must be three digits",
+                            self.span_from(start),
+                        ));
+                    }
+                } else if group_len == 0 || group_len > 3 || first_group_all_zeros {
+                    // The first group is one to three digits and not all zeros
+                    return Err(ParseError::new(
+                        "misplaced thousands separator",
+                        self.span_from(start),
+                    ));
+                }
+                group_closed = true;
+                group_len = 0;
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        // With any separator, the last integer group must also be three digits,
+        // which rejects a trailing separator and a short final group like `1,00`
+        if group_closed && group_len != 3 {
+            return Err(ParseError::new(
+                "thousands groups must be three digits",
+                self.span_from(start),
+            ));
+        }
+        if self.peek() == Some(decimal) {
+            self.bump();
+            text.push('.');
+            while let Some(b) = self.peek() {
+                if b.is_ascii_digit() {
+                    text.push(char::from(b));
+                    has_digit = true;
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+        }
+        if !has_digit {
+            return Err(ParseError::new("expected a number", self.span_from(start)));
+        }
+        // The text holds only a sign, digits, and one dot, so the only failures
+        // are a magnitude too large for a decimal or a fraction with more digits
+        // than a decimal can hold
+        Decimal::from_str_exact(&text).map_err(|err| {
+            let message = match err {
+                rust_decimal::Error::Underflow => {
+                    "number has more fractional digits than a decimal can represent"
+                }
+                _ => "number is too large to represent",
+            };
+            ParseError::new(message, self.span_from(start))
+        })
+    }
+
+    /// Scan a commodity symbol, quoted or bare, returning it without quotes
+    fn take_commodity(&mut self) -> Result<String, ParseError> {
+        match self.peek() {
+            Some(b'"') => {
+                let open = self.pos;
+                self.bump();
+                let content = self.pos;
+                while let Some(b) = self.peek() {
+                    if b == b'"' {
+                        let symbol = self.slice(content, self.pos);
+                        self.bump();
+                        return Ok(symbol);
+                    }
+                    // A quote has no escape and amounts live on one line, so a
+                    // control byte inside the quotes could not format back as one
+                    // token. Reject it at the offending byte
+                    if b.is_ascii_control() {
+                        return Err(ParseError::new(
+                            "control character in commodity",
+                            Span::new(clamp_u32(self.pos), clamp_u32(self.pos.saturating_add(1))),
+                        ));
+                    }
+                    self.bump();
+                }
+                Err(ParseError::new(
+                    "unterminated commodity quote",
+                    self.rest_from(open),
+                ))
+            }
+            Some(b) if is_commodity_byte(b) => {
+                let start = self.pos;
+                while matches!(self.peek(), Some(b) if is_commodity_byte(b)) {
+                    self.bump();
+                }
+                Ok(self.slice(start, self.pos))
+            }
+            _ => Err(ParseError::new(
+                "expected a commodity",
+                self.rest_from(self.pos),
+            )),
+        }
+    }
+
+    fn slice(&self, start: usize, end: usize) -> String {
+        // Start and end come from the cursor, so they land on char boundaries.
+        // The debug assert trips if a later change breaks that invariant, and
+        // the release fallback still degrades to empty rather than an unwrap
+        debug_assert!(
+            self.src.get(start..end).is_some(),
+            "slice {start}..{end} is not on a char boundary"
+        );
+        self.src.get(start..end).unwrap_or_default().to_string()
+    }
+
+    /// A span from `start` to the cursor
+    fn span_from(&self, start: usize) -> Span {
+        Span::new(clamp_u32(start), clamp_u32(self.pos))
+    }
+
+    /// A span from `start` to end-of-input, for an error that runs off the end
+    fn rest_from(&self, start: usize) -> Span {
+        Span::new(clamp_u32(start), clamp_u32(self.bytes.len()))
+    }
+}
+
+/// Whether a byte can appear in a bare, unquoted commodity symbol
+///
+/// A bare symbol ends at whitespace, an ASCII control byte, a digit, or a
+/// character the amount grammar gives its own meaning (sign, dot, comma, quote,
+/// cost `@`, comment `;`, assertion `=`, the multiplier `*`, and the brackets
+/// around virtual postings and lot prices). A non-ascii byte is always part of
+/// the symbol
+fn is_commodity_byte(b: u8) -> bool {
+    !(b.is_ascii_whitespace()
+        || b.is_ascii_control()
+        || b.is_ascii_digit()
+        || matches!(
+            b,
+            b'-' | b'+'
+                | b'.'
+                | b','
+                | b'"'
+                | b'@'
+                | b';'
+                | b'='
+                | b'*'
+                | b'('
+                | b')'
+                | b'['
+                | b']'
+                | b'{'
+                | b'}'
+        ))
+}
+
+/// Whether a symbol must be quoted to scan back as one token
+fn needs_quotes(symbol: &str) -> bool {
+    symbol.is_empty() || symbol.bytes().any(|b| !is_commodity_byte(b))
+}
+
+/// Whether a symbol can format back and scan again as the same one token
+///
+/// Quoting recovers spaces and grammar characters, but a `"` has no escape and
+/// an ASCII control byte would corrupt the single-line journal, so a symbol
+/// holding either cannot round-trip
+fn symbol_round_trips(symbol: &str) -> bool {
+    !symbol.bytes().any(|b| b == b'"' || b.is_ascii_control())
+}
+
+/// Whether a byte starts a number: a digit, or the decimal mark for a leading
+/// fraction like `.5` under the period style or `,5` under the comma style
+fn is_number_start(b: u8, decimal: u8) -> bool {
+    b.is_ascii_digit() || b == decimal
+}
+
+/// Saturate a byte offset into `u32`, matching the span offset width
+fn clamp_u32(v: usize) -> u32 {
+    u32::try_from(v).unwrap_or(u32::MAX)
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[allow(clippy::unwrap_used, reason = "unwrap keeps the table tests terse")]
+mod tests {
+    use super::{Amount, DecimalStyle, Placement};
+    use crate::span::Span;
+
+    // Parse a period-style shape, check its parts, then prove the value survives
+    // a format then re-parse
+    fn check(input: &str, quantity: &str, symbol: &str, placement: Placement) {
+        check_styled(input, quantity, symbol, placement, DecimalStyle::Period);
+    }
+
+    // Parse a shape in the given style, check the quantity, symbol, placement,
+    // and style, then prove it survives a format then re-parse in that style
+    fn check_styled(
+        input: &str,
+        quantity: &str,
+        symbol: &str,
+        placement: Placement,
+        style: DecimalStyle,
+    ) {
+        let amount = Amount::parse_styled(input, style).unwrap();
+        assert_eq!(
+            amount.quantity.to_string(),
+            quantity,
+            "quantity of {input:?}"
+        );
+        assert_eq!(amount.commodity.symbol(), symbol, "symbol of {input:?}");
+        assert_eq!(
+            amount.commodity.placement(),
+            placement,
+            "placement of {input:?}"
+        );
+        assert_eq!(amount.style, style, "style of {input:?}");
+
+        let reparsed = Amount::parse_styled(&amount.to_string(), style).unwrap();
+        assert_eq!(
+            reparsed,
+            amount,
+            "round-trip of {input:?} via {:?}",
+            amount.to_string()
+        );
+    }
+
+    #[test]
+    fn prefix_commodity_shapes() {
+        check("$5", "5", "$", Placement::Prefix);
+        check("$5.00", "5.00", "$", Placement::Prefix);
+        check("$1,000.50", "1000.50", "$", Placement::Prefix);
+        // A sign on either side of a prefix commodity means the same amount
+        check("-$5", "-5", "$", Placement::Prefix);
+        check("$-5", "-5", "$", Placement::Prefix);
+        check("+$5", "5", "$", Placement::Prefix);
+        // Spaces around the prefix and its sign are tolerated
+        check("$ 5", "5", "$", Placement::Prefix);
+        check("$ -5", "-5", "$", Placement::Prefix);
+    }
+
+    #[test]
+    fn suffix_commodity_shapes() {
+        check("5 VTI", "5", "VTI", Placement::Suffix);
+        check("-5 VTI", "-5", "VTI", Placement::Suffix);
+        check("1,234.56 EUR", "1234.56", "EUR", Placement::Suffix);
+        // The separating space is optional, the digit boundary is unambiguous
+        check("5VTI", "5", "VTI", Placement::Suffix);
+        // A bare fraction keeps its leading zero when formatted back
+        check(".5 VTI", "0.5", "VTI", Placement::Suffix);
+    }
+
+    #[test]
+    fn well_formed_thousands_groups_parse() {
+        // The first group is one to three digits, every later group is three,
+        // and the commas drop out of the canonical form
+        check("$1,000", "1000", "$", Placement::Prefix);
+        check("$12,345", "12345", "$", Placement::Prefix);
+        check("$123,456", "123456", "$", Placement::Prefix);
+        check("$1,000,000", "1000000", "$", Placement::Prefix);
+        check("$1,234,567.89", "1234567.89", "$", Placement::Prefix);
+    }
+
+    #[test]
+    fn malformed_thousands_grouping_is_an_error() {
+        // A comma is a thousands separator only, never a decimal, so a comma that
+        // is not well-formed grouping is rejected rather than reinterpreted the
+        // way ledger-cli would read `1,00` as `1.00` or `0,075` as `0.075`
+        for input in [
+            "$1,00",        // short final group
+            "$1,2,3",       // short middle group
+            "$1,00,00",     // short groups
+            "$9,99,99,999", // lakh grouping, the group after the first comma is two digits
+            "$0,075",       // zero integer group
+            "$5,",          // trailing comma
+            "$,5",          // leading comma
+            "$1234,000",    // first group longer than three digits
+        ] {
+            let err = Amount::parse(input).unwrap_err();
+            assert!(
+                err.message.contains("thousands"),
+                "expected a thousands error for {input:?}, got {:?}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn european_style_flips_the_marks() {
+        // Comma is the decimal, period is the thousands separator, same grouping
+        check_styled(
+            "€1.000",
+            "1000",
+            "€",
+            Placement::Prefix,
+            DecimalStyle::Comma,
+        );
+        check_styled(
+            "1.234,56 EUR",
+            "1234.56",
+            "EUR",
+            Placement::Suffix,
+            DecimalStyle::Comma,
+        );
+        check_styled(
+            "1.000.000,00 EUR",
+            "1000000.00",
+            "EUR",
+            Placement::Suffix,
+            DecimalStyle::Comma,
+        );
+        // A comma decimal, including a leading one, mirrors the period style
+        check_styled("€1,50", "1.50", "€", Placement::Prefix, DecimalStyle::Comma);
+        check_styled(
+            ",5 EUR",
+            "0.5",
+            "EUR",
+            Placement::Suffix,
+            DecimalStyle::Comma,
+        );
+    }
+
+    #[test]
+    fn european_amount_formats_back_with_a_comma() {
+        // The style is kept so the amount prints in the style it was read in,
+        // and grouping still drops out of the canonical form
+        let amount = Amount::parse_styled("1.234,56 EUR", DecimalStyle::Comma).unwrap();
+        assert_eq!(amount.to_string(), "1234,56 EUR");
+    }
+
+    #[test]
+    fn the_same_digits_differ_by_style() {
+        // `1,000` is a thousands group under the period style and a comma decimal
+        // under the comma style, so the caller's choice decides the value
+        let anglo = Amount::parse_styled("1,000 X", DecimalStyle::Period).unwrap();
+        let euro = Amount::parse_styled("1,000 X", DecimalStyle::Comma).unwrap();
+        assert_eq!(anglo.quantity.to_string(), "1000");
+        assert_eq!(euro.quantity.to_string(), "1.000");
+    }
+
+    #[test]
+    fn malformed_european_grouping_is_an_error() {
+        // The period is a thousands separator only under the comma style, so the
+        // mirror of the period-style malformed cases is rejected
+        for input in [
+            "€1.00",  // short final group
+            "€1.2.3", // short middle group
+            "€0.075", // zero integer group
+            "€5.",    // trailing separator
+            "€.5",    // leading separator
+        ] {
+            let err = Amount::parse_styled(input, DecimalStyle::Comma).unwrap_err();
+            assert!(
+                err.message.contains("thousands"),
+                "expected a thousands error for {input:?}, got {:?}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_commodity_carries_spaces() {
+        check(
+            "100.00 \"MUTF: VFIAX\"",
+            "100.00",
+            "MUTF: VFIAX",
+            Placement::Suffix,
+        );
+    }
+
+    #[test]
+    fn quotes_are_dropped_when_not_needed() {
+        // An input may quote a symbol that needs none, the value is unchanged
+        // and the canonical form drops the quotes
+        let amount = Amount::parse("5 \"VTI\"").unwrap();
+        assert_eq!(amount.commodity.symbol(), "VTI");
+        assert_eq!(amount.to_string(), "5 VTI");
+    }
+
+    #[test]
+    fn unterminated_quote_errors_at_the_quote() {
+        // The quote opens at byte 2 (`5`, space, then `"`) and the error spans
+        // from there to the end of input
+        let err = Amount::parse("5 \"MUTF: VFIAX").unwrap_err();
+        assert_eq!(err.message, "unterminated commodity quote");
+        assert_eq!(err.span, Span::new(2, 14));
+    }
+
+    #[test]
+    fn a_missing_commodity_is_an_error() {
+        let err = Amount::parse("5").unwrap_err();
+        assert_eq!(err.message, "expected a commodity");
+    }
+
+    #[test]
+    fn a_missing_number_is_an_error() {
+        let err = Amount::parse("$").unwrap_err();
+        assert_eq!(err.message, "expected a number");
+    }
+
+    #[test]
+    fn a_number_too_precise_is_an_error() {
+        // 29 fractional digits is one past what a decimal holds, and rounding it
+        // would silently drop precision, so scanning rejects it instead
+        let err = Amount::parse("0.12345678901234567890123456789 VTI").unwrap_err();
+        assert_eq!(
+            err.message,
+            "number has more fractional digits than a decimal can represent"
+        );
+    }
+
+    #[test]
+    fn a_control_byte_in_a_quoted_commodity_is_an_error() {
+        // A tab inside the quotes has no escape and would break the single-line
+        // journal, and the span points at the offending byte
+        let err = Amount::parse("5 \"A\tB\"").unwrap_err();
+        assert_eq!(err.message, "control character in commodity");
+        assert_eq!(err.span, Span::new(4, 5));
+    }
+
+    #[test]
+    fn trailing_characters_are_an_error() {
+        let err = Amount::parse("$5 x").unwrap_err();
+        assert_eq!(err.message, "unexpected characters after the amount");
+    }
+
+    #[test]
+    fn leading_whitespace_is_a_clear_error() {
+        // The input is exactly the amount, so a leading space is reported as
+        // such rather than as a missing commodity, spanning the whitespace run
+        let err = Amount::parse("  $5").unwrap_err();
+        assert_eq!(err.message, "leading whitespace before the amount");
+        assert_eq!(err.span, Span::new(0, 2));
+    }
+
+    #[test]
+    fn trailing_whitespace_is_a_clear_error() {
+        let err = Amount::parse("$5 ").unwrap_err();
+        assert_eq!(err.message, "trailing whitespace after the amount");
+        assert_eq!(err.span, Span::new(2, 3));
+    }
+
+    #[test]
+    fn a_second_sign_is_a_clear_error() {
+        // The leading sign already bound to the number, so the sign between the
+        // commodity and the number is the second one, reported at that byte
+        let err = Amount::parse("-$-5").unwrap_err();
+        assert_eq!(err.message, "amount has more than one sign");
+        assert_eq!(err.span, Span::new(2, 3));
+    }
+}
