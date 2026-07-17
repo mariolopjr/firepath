@@ -11,7 +11,7 @@
 //! formats back with them.
 
 use crate::error::ParseError;
-use crate::span::Span;
+use crate::span::{Span, clamp_u32};
 use rust_decimal::Decimal;
 use std::fmt;
 
@@ -64,15 +64,26 @@ pub struct Commodity {
 impl Commodity {
     /// A commodity with the given symbol and placement
     ///
-    /// The symbol must hold no `"` and no ASCII control byte: a quote has no
-    /// escape in the grammar and a control byte would corrupt the single-line
-    /// journal, so either would keep the commodity from formatting back to
-    /// itself
-    pub fn new(symbol: impl Into<String>, placement: Placement) -> Self {
+    /// # Errors
+    /// The symbol must be nonempty and hold no `"` and no ASCII control byte:
+    /// an empty symbol formats to nothing, a quote has no escape in the
+    /// grammar, and a control byte would corrupt the single-line journal, so
+    /// any of them would keep the commodity from formatting back to itself
+    pub fn new(symbol: impl Into<String>, placement: Placement) -> Result<Self, SymbolError> {
         let symbol = symbol.into();
+        if symbol_round_trips(&symbol) {
+            Ok(Self { symbol, placement })
+        } else {
+            Err(SymbolError { symbol })
+        }
+    }
+
+    /// A commodity scanned out of an amount. The scanner already refused the
+    /// symbols [`new`](Commodity::new) rejects, so this cannot fail
+    fn scanned(symbol: String, placement: Placement) -> Self {
         debug_assert!(
             symbol_round_trips(&symbol),
-            "commodity symbol must not hold a quote or control byte: {symbol:?}"
+            "scanner let through a symbol that cannot round-trip: {symbol:?}"
         );
         Self { symbol, placement }
     }
@@ -90,9 +101,9 @@ impl Commodity {
 
 impl fmt::Display for Commodity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Quote only when the bare symbol would not scan back as one token: an
-        // empty symbol, or one holding whitespace, a digit, or a character that
-        // ends an unquoted symbol
+        // Quote only when the bare symbol would not scan back as one token: one
+        // holding whitespace, a digit, or a character that ends an unquoted
+        // symbol
         if needs_quotes(&self.symbol) {
             write!(f, "\"{}\"", self.symbol)
         } else {
@@ -100,6 +111,27 @@ impl fmt::Display for Commodity {
         }
     }
 }
+
+/// The error from [`Commodity::new`]: a symbol that could not format back and
+/// scan again as the same token
+///
+/// Carries the rejected symbol so the message names it
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolError {
+    symbol: String,
+}
+
+impl fmt::Display for SymbolError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "commodity symbol must be nonempty with no quote or control byte: {:?}",
+            self.symbol
+        )
+    }
+}
+
+impl std::error::Error for SymbolError {}
 
 /// A quantity paired with its commodity
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,10 +172,10 @@ impl Amount {
     ///
     /// # Errors
     /// The span is a byte range into `src`. Errors: leading or trailing
-    /// whitespace, an unterminated quoted commodity, a control byte inside a
-    /// quoted commodity, a missing number or commodity, more than one sign,
-    /// malformed thousands grouping, a quantity too large or too precise for
-    /// [`Decimal`], or characters left over after the amount
+    /// whitespace, an unterminated or empty quoted commodity, a control byte
+    /// inside a quoted commodity, a missing number or commodity, more than one
+    /// sign, malformed thousands grouping, a quantity too large or too precise
+    /// for [`Decimal`], or characters left over after the amount
     pub fn parse_styled(src: &str, style: DecimalStyle) -> Result<Self, ParseError> {
         let mut s = Scanner::new(src);
         let (_, decimal) = style.marks();
@@ -176,7 +208,7 @@ impl Amount {
                 let quantity = s.take_number(negative, style)?;
                 s.skip_spaces();
                 let symbol = s.take_commodity()?;
-                (quantity, Commodity::new(symbol, Placement::Suffix))
+                (quantity, Commodity::scanned(symbol, Placement::Suffix))
             }
             // Anything else that is not end-of-input starts a prefix commodity:
             // `$5`, and a sign may sit between commodity and number: `$-5`
@@ -196,7 +228,7 @@ impl Amount {
                     negative = neg;
                 }
                 let quantity = s.take_number(negative, style)?;
-                (quantity, Commodity::new(symbol, Placement::Prefix))
+                (quantity, Commodity::scanned(symbol, Placement::Prefix))
             }
             None => return Err(ParseError::new("expected an amount", s.rest_from(0))),
         };
@@ -408,6 +440,14 @@ impl<'a> Scanner<'a> {
                     if b == b'"' {
                         let symbol = self.slice(content, self.pos);
                         self.bump();
+                        // Empty quotes would allow in an amount with no
+                        // commodity, which the grammar refuses when written bare
+                        if symbol.is_empty() {
+                            return Err(ParseError::new(
+                                "empty commodity",
+                                Span::new(clamp_u32(open), clamp_u32(self.pos)),
+                            ));
+                        }
                         return Ok(symbol);
                     }
                     // A quote has no escape and amounts live on one line, so a
@@ -493,17 +533,20 @@ fn is_commodity_byte(b: u8) -> bool {
 }
 
 /// Whether a symbol must be quoted to scan back as one token
+///
+/// The symbol is nonempty, the [`Commodity`] constructor's contract
 fn needs_quotes(symbol: &str) -> bool {
-    symbol.is_empty() || symbol.bytes().any(|b| !is_commodity_byte(b))
+    symbol.bytes().any(|b| !is_commodity_byte(b))
 }
 
 /// Whether a symbol can format back and scan again as the same one token
 ///
-/// Quoting recovers spaces and grammar characters, but a `"` has no escape and
-/// an ASCII control byte would corrupt the single-line journal, so a symbol
-/// holding either cannot round-trip
+/// Quoting recovers spaces and grammar characters, but an empty symbol formats
+/// to nothing, a `"` has no escape, and an ASCII control byte would corrupt
+/// the single-line journal, so a symbol that is empty or holds either cannot
+/// round-trip
 fn symbol_round_trips(symbol: &str) -> bool {
-    !symbol.bytes().any(|b| b == b'"' || b.is_ascii_control())
+    !symbol.is_empty() && !symbol.bytes().any(|b| b == b'"' || b.is_ascii_control())
 }
 
 /// Whether a byte starts a number: a digit, or the decimal mark for a leading
@@ -512,17 +555,17 @@ fn is_number_start(b: u8, decimal: u8) -> bool {
     b.is_ascii_digit() || b == decimal
 }
 
-/// Saturate a byte offset into `u32`, matching the span offset width
-fn clamp_u32(v: usize) -> u32 {
-    u32::try_from(v).unwrap_or(u32::MAX)
-}
-
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[allow(clippy::unwrap_used, reason = "unwrap keeps the table tests terse")]
 mod tests {
-    use super::{Amount, DecimalStyle, Placement};
+    use super::{Amount, Commodity, DecimalStyle, Placement};
     use crate::span::Span;
+
+    // The grouping error messages, shared so the period and comma style tests
+    // pin one wording
+    const MISPLACED: &str = "misplaced thousands separator";
+    const THREE: &str = "thousands groups must be three digits";
 
     // Parse a period-style shape, check its parts, then prove the value survives
     // a format then re-parse
@@ -588,6 +631,15 @@ mod tests {
     }
 
     #[test]
+    fn a_trailing_decimal_mark_is_tolerated() {
+        // A decimal mark with no fraction still reads as the integer, and the
+        // canonical form drops it. Contrast with the trailing thousands
+        // separator in the malformed grouping tests, which is an error
+        check("$5.", "5", "$", Placement::Prefix);
+        check_styled("5, EUR", "5", "EUR", Placement::Suffix, DecimalStyle::Comma);
+    }
+
+    #[test]
     fn well_formed_thousands_groups_parse() {
         // The first group is one to three digits, every later group is three,
         // and the commas drop out of the canonical form
@@ -602,23 +654,21 @@ mod tests {
     fn malformed_thousands_grouping_is_an_error() {
         // A comma is a thousands separator only, never a decimal, so a comma that
         // is not well-formed grouping is rejected rather than reinterpreted the
-        // way ledger-cli would read `1,00` as `1.00` or `0,075` as `0.075`
-        for input in [
-            "$1,00",        // short final group
-            "$1,2,3",       // short middle group
-            "$1,00,00",     // short groups
-            "$9,99,99,999", // lakh grouping, the group after the first comma is two digits
-            "$0,075",       // zero integer group
-            "$5,",          // trailing comma
-            "$,5",          // leading comma
-            "$1234,000",    // first group longer than three digits
+        // way ledger-cli would read `1,00` as `1.00` or `0,075` as `0.075`. A
+        // separator in an impossible position is misplaced; groups of the wrong
+        // width get the three-digits error
+        for (input, message) in [
+            ("$1,00", THREE),         // short final group
+            ("$1,2,3", THREE),        // short middle group
+            ("$1,00,00", THREE),      // short groups
+            ("$9,99,99,999", THREE),  // lakh grouping, two-digit second group
+            ("$0,075", MISPLACED),    // zero integer group
+            ("$5,", THREE),           // trailing comma leaves an empty group
+            ("$,5", MISPLACED),       // leading comma
+            ("$1234,000", MISPLACED), // first group longer than three digits
         ] {
             let err = Amount::parse(input).unwrap_err();
-            assert!(
-                err.message.contains("thousands"),
-                "expected a thousands error for {input:?}, got {:?}",
-                err.message
-            );
+            assert_eq!(err.message, message, "error for {input:?}");
         }
     }
 
@@ -679,19 +729,15 @@ mod tests {
     fn malformed_european_grouping_is_an_error() {
         // The period is a thousands separator only under the comma style, so the
         // mirror of the period-style malformed cases is rejected
-        for input in [
-            "€1.00",  // short final group
-            "€1.2.3", // short middle group
-            "€0.075", // zero integer group
-            "€5.",    // trailing separator
-            "€.5",    // leading separator
+        for (input, message) in [
+            ("€1.00", THREE),      // short final group
+            ("€1.2.3", THREE),     // short middle group
+            ("€0.075", MISPLACED), // zero integer group
+            ("€5.", THREE),        // trailing separator
+            ("€.5", MISPLACED),    // leading separator
         ] {
             let err = Amount::parse_styled(input, DecimalStyle::Comma).unwrap_err();
-            assert!(
-                err.message.contains("thousands"),
-                "expected a thousands error for {input:?}, got {:?}",
-                err.message
-            );
+            assert_eq!(err.message, message, "error for {input:?}");
         }
     }
 
@@ -724,15 +770,83 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_input_is_an_error() {
+        let err = Amount::parse("").unwrap_err();
+        assert_eq!(err.message, "expected an amount");
+        assert_eq!(err.span, Span::new(0, 0));
+        // A lone sign runs out of input the same way, spanning the sign
+        let err = Amount::parse("-").unwrap_err();
+        assert_eq!(err.message, "expected an amount");
+        assert_eq!(err.span, Span::new(0, 1));
+    }
+
+    #[test]
     fn a_missing_commodity_is_an_error() {
         let err = Amount::parse("5").unwrap_err();
         assert_eq!(err.message, "expected a commodity");
     }
 
     #[test]
+    fn a_grammar_byte_where_the_commodity_belongs_is_an_error() {
+        // `@` ends a bare symbol, so it cannot start one, in either position
+        let err = Amount::parse("5 @").unwrap_err();
+        assert_eq!(err.message, "expected a commodity");
+        let err = Amount::parse("@5").unwrap_err();
+        assert_eq!(err.message, "expected a commodity");
+    }
+
+    #[test]
+    fn a_control_byte_ends_a_bare_commodity() {
+        // The symbol ends at the control byte, which is then left over
+        let err = Amount::parse("5 VTI\u{1}").unwrap_err();
+        assert_eq!(err.message, "unexpected characters after the amount");
+        assert_eq!(err.span, Span::new(5, 6));
+    }
+
+    #[test]
+    fn an_empty_quoted_commodity_is_an_error() {
+        // Empty quotes would allow in an amount with no commodity, which the
+        // grammar refuses when written bare, and the span covers the quotes
+        let err = Amount::parse("5 \"\"").unwrap_err();
+        assert_eq!(err.message, "empty commodity");
+        assert_eq!(err.span, Span::new(2, 4));
+    }
+
+    #[test]
+    fn a_symbol_that_cannot_round_trip_is_refused() {
+        // An empty symbol formats to nothing, a quote has no escape, and a
+        // control byte would corrupt the single-line journal, so the
+        // constructor refuses all three and its error names the symbol
+        for symbol in ["", "A\"B", "A\u{1}B"] {
+            let err = Commodity::new(symbol, Placement::Suffix).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "commodity symbol must be nonempty with no quote or control byte: {symbol:?}"
+                ),
+                "refusal expected for {symbol:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_round_trippable_symbol_constructs() {
+        let usd = Commodity::new("USD", Placement::Prefix).unwrap();
+        assert_eq!(usd.symbol(), "USD");
+        assert_eq!(usd.placement(), Placement::Prefix);
+    }
+
+    #[test]
     fn a_missing_number_is_an_error() {
         let err = Amount::parse("$").unwrap_err();
         assert_eq!(err.message, "expected a number");
+    }
+
+    #[test]
+    fn a_number_too_large_is_an_error() {
+        // 29 nines exceed Decimal's 96-bit maximum magnitude
+        let err = Amount::parse("$99999999999999999999999999999").unwrap_err();
+        assert_eq!(err.message, "number is too large to represent");
     }
 
     #[test]
@@ -757,8 +871,10 @@ mod tests {
 
     #[test]
     fn trailing_characters_are_an_error() {
+        // The span covers everything left over, the space included
         let err = Amount::parse("$5 x").unwrap_err();
         assert_eq!(err.message, "unexpected characters after the amount");
+        assert_eq!(err.span, Span::new(2, 4));
     }
 
     #[test]

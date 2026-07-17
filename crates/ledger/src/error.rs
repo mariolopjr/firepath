@@ -109,6 +109,16 @@ mod tests {
     }
 
     #[test]
+    fn columns_count_bytes_not_chars() {
+        // é is two bytes, so the byte after it lands in column three, and the
+        // \r of a CRLF ending is a column of its own line
+        let index = LineIndex::new("é.\r\nx");
+        assert_eq!(index.line_col(2), lc(1, 3)); // the dot after the two-byte é
+        assert_eq!(index.line_col(3), lc(1, 4)); // the \r itself
+        assert_eq!(index.line_col(5), lc(2, 1)); // x, first byte after the CRLF
+    }
+
+    #[test]
     fn an_offset_past_the_end_resolves_against_the_last_line() {
         let index = LineIndex::new("abc\ndef\n");
         // offset 8 is one past the final newline, on the empty trailing line

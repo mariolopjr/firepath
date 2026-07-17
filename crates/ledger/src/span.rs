@@ -63,6 +63,11 @@ impl Span {
     }
 }
 
+/// Saturate a byte offset into `u32`, matching the span offset width
+pub(crate) fn clamp_u32(v: usize) -> u32 {
+    u32::try_from(v).unwrap_or(u32::MAX)
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -85,6 +90,14 @@ mod tests {
     #[test]
     fn an_equal_bounded_span_is_empty() {
         assert!(Span::new(5, 5).is_empty());
+    }
+
+    #[test]
+    fn an_offset_wider_than_u32_saturates() {
+        assert_eq!(super::clamp_u32(7), 7);
+        // Unreachable through the scanners without a >4 GiB source, so the
+        // saturation is pinned directly
+        assert_eq!(super::clamp_u32(usize::MAX), u32::MAX);
     }
 
     #[test]

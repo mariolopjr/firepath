@@ -5,17 +5,22 @@
 //! `file:line:col` through a [`LineIndex`] ([`ParseError`]), and the per-file
 //! result container ([`Parsed`]).
 //!
-//! On top of that sits the first scanner: [`Amount`], a [`Commodity`] and an
+//! On top of that sit the first scanners: [`Amount`], a [`Commodity`] and an
 //! exact `Decimal` quantity, with the [`Placement`] and [`DecimalStyle`] that
-//! let it format back to the shape it was read from
+//! let it format back to the shape it was read from.
+//!
+//! [`Date`], a jiff civil date within ledger's 1400-9999 year range, keeping
+//! the [`Separator`] it was written with
 
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 mod amount;
+mod date;
 mod error;
 mod span;
 
-pub use amount::{Amount, Commodity, DecimalStyle, Placement};
+pub use amount::{Amount, Commodity, DecimalStyle, Placement, SymbolError};
+pub use date::{Date, Separator};
 pub use error::{LineCol, LineIndex, ParseError};
 pub use span::{FileId, Span};
 

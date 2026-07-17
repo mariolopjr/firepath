@@ -10,6 +10,7 @@ authors = ["Mario Lopez"]
 
 [workspace.dependencies]
 clap = { version = "4.5", features = ["derive"] }
+jiff = { version = "0.2", default-features = false, features = ["std"] }
 memchr = "2.8"
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
