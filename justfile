@@ -1,3 +1,9 @@
+alias b := build
+alias c := check
+alias C := coverage
+alias l := lint
+alias t := test
+
 default: check
 
 # Compile the whole workspace
