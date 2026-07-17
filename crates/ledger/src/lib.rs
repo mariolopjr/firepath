@@ -15,7 +15,10 @@
 //! Above the scanners, [`blocks`] groups a file's lines into [`Block`]s:
 //! column-0 lines classified by first byte ([`BlockKind`]) with their
 //! indented lines attached, and `comment`/`test` regions grouped whole, the
-//! shape the per-block parsers consume
+//! shape the per-block parsers consume.
+//!
+//! The first per-block parser: [`TransactionHeader`] reads a transaction
+//! block's opening line into its dates, [`Status`], code, and payee
 
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
@@ -24,12 +27,14 @@ mod date;
 mod error;
 mod lines;
 mod span;
+mod transaction;
 
 pub use amount::{Amount, Commodity, DecimalStyle, Placement, SymbolError};
 pub use date::{Date, Separator};
 pub use error::{LineCol, LineIndex, ParseError};
 pub use lines::{Block, BlockKind, blocks};
 pub use span::{FileId, Span};
+pub use transaction::{Status, TransactionHeader};
 
 /// The result of parsing one source file: the items parsed plus every error
 ///
