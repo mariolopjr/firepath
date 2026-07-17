@@ -10,18 +10,25 @@
 //! let it format back to the shape it was read from.
 //!
 //! [`Date`], a jiff civil date within ledger's 1400-9999 year range, keeping
-//! the [`Separator`] it was written with
+//! the [`Separator`] it was written with.
+//!
+//! Above the scanners, [`blocks`] groups a file's lines into [`Block`]s:
+//! column-0 lines classified by first byte ([`BlockKind`]) with their
+//! indented lines attached, and `comment`/`test` regions grouped whole, the
+//! shape the per-block parsers consume
 
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 mod amount;
 mod date;
 mod error;
+mod lines;
 mod span;
 
 pub use amount::{Amount, Commodity, DecimalStyle, Placement, SymbolError};
 pub use date::{Date, Separator};
 pub use error::{LineCol, LineIndex, ParseError};
+pub use lines::{Block, BlockKind, blocks};
 pub use span::{FileId, Span};
 
 /// The result of parsing one source file: the items parsed plus every error
