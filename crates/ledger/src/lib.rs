@@ -17,8 +17,10 @@
 //! indented lines attached, and `comment`/`test` regions grouped whole, the
 //! shape the per-block parsers consume.
 //!
-//! The first per-block parser: [`TransactionHeader`] reads a transaction
-//! block's opening line into its dates, [`Status`], code, and payee
+//! The per-block parsers read a block's lines into its parts:
+//! [`TransactionHeader`] reads a transaction's opening line into its dates,
+//! [`Status`], code, and payee, and [`Posting`] reads an indented child line
+//! into its account, amount, and [`PostingKind`]
 
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
@@ -26,6 +28,8 @@ mod amount;
 mod date;
 mod error;
 mod lines;
+mod posting;
+mod scan;
 mod span;
 mod transaction;
 
@@ -33,6 +37,7 @@ pub use amount::{Amount, Commodity, DecimalStyle, Placement, SymbolError};
 pub use date::{Date, Separator};
 pub use error::{LineCol, LineIndex, ParseError};
 pub use lines::{Block, BlockKind, blocks};
+pub use posting::{Posting, PostingKind};
 pub use span::{FileId, Span};
 pub use transaction::{Status, TransactionHeader};
 

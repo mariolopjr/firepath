@@ -9,6 +9,7 @@
 
 use crate::date::Date;
 use crate::error::ParseError;
+use crate::scan::{skip_ws, span_at, trim_end, widen_empty};
 use crate::span::{Span, clamp_u32};
 
 /// The clearing status a header carries between the date and the payee
@@ -112,10 +113,7 @@ impl TransactionHeader {
 
         // The payee is the rest of the line, trailing whitespace dropped.
         // Internal runs of spaces stay: the payee has no column split
-        let mut end = bytes.len();
-        while end > pos && matches!(bytes.get(end.saturating_sub(1)), Some(b' ' | b'\t')) {
-            end = end.saturating_sub(1);
-        }
+        let end = trim_end(bytes, pos, bytes.len());
         let payee = (pos < end).then(|| span_at(base, pos, end));
 
         Ok(Self {
@@ -129,40 +127,18 @@ impl TransactionHeader {
     }
 }
 
-/// The first index at or past `pos` holding neither a space nor a tab
-fn skip_ws(bytes: &[u8], mut pos: usize) -> usize {
-    while matches!(bytes.get(pos), Some(b' ' | b'\t')) {
-        pos = pos.saturating_add(1);
-    }
-    pos
-}
-
-/// A file-absolute span for the `start..end` byte range within the line
-fn span_at(base: u32, start: usize, end: usize) -> Span {
-    Span::new(
-        base.saturating_add(clamp_u32(start)),
-        base.saturating_add(clamp_u32(end)),
-    )
-}
-
 /// Re-anchor a scanner error from token-relative to file-absolute offsets,
 /// for a token starting `token_start` bytes into the line
 ///
-/// An empty token errors with an empty span, which no editor can show, so an
-/// empty span widens to one byte: the one after it, or the one before when it
-/// sits at the line's end. An empty line has neither, and the span stays empty
+/// An empty token errors with an empty span, so the re-anchored span is widened
+/// to stay visible, bounded by the line it lands in
 fn shift(err: ParseError, base: u32, token_start: usize, line_len: usize) -> ParseError {
     let delta = base.saturating_add(clamp_u32(token_start));
-    let mut start = err.span.start().saturating_add(delta);
-    let mut end = err.span.end().saturating_add(delta);
-    if start == end {
-        if end < base.saturating_add(clamp_u32(line_len)) {
-            end = end.saturating_add(1);
-        } else if start > base {
-            start = start.saturating_sub(1);
-        }
-    }
-    ParseError::new(err.message, Span::new(start, end))
+    let span = Span::new(
+        err.span.start().saturating_add(delta),
+        err.span.end().saturating_add(delta),
+    );
+    ParseError::new(err.message, widen_empty(span, base, line_len))
 }
 
 #[cfg(test)]
