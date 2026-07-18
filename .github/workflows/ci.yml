@@ -29,6 +29,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@just
       - run: just check
+  acceptance:
+    name: acceptance / ${{ matrix.os }}
+    runs-on: ubuntu-24
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@just
+      - name: Install ledger
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install ledger
+          else
+            sudo apt-get update && sudo apt-get install -y ledger
+          fi
+      - run: just accept-ledger
   deny:
     name: deny
     runs-on: ubuntu-24.04

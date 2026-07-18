@@ -21,7 +21,12 @@
 //! [`TransactionHeader`] reads a transaction's opening line into its dates,
 //! [`Status`], code, and payee, [`Posting`] reads an indented child line into
 //! its account, amount, and [`PostingKind`], and [`Directive`] captures an
-//! `include` argument while refusing the directives firepath does not model yet
+//! `include` argument while refusing the directives firepath does not model
+//! yet.
+//!
+//! [`parse`] ties them together: it groups a whole file with [`blocks`] and
+//! dispatches each block to its scanner. At the moment only returns any errors
+//! encountered.
 
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
@@ -30,6 +35,7 @@ mod date;
 mod directive;
 mod error;
 mod lines;
+mod parse;
 mod posting;
 mod scan;
 mod span;
@@ -40,6 +46,7 @@ pub use date::{Date, Separator};
 pub use directive::Directive;
 pub use error::{LineCol, LineIndex, ParseError};
 pub use lines::{Block, BlockKind, blocks};
+pub use parse::parse;
 pub use posting::{Posting, PostingKind};
 pub use span::{FileId, Span};
 pub use transaction::{Status, TransactionHeader};

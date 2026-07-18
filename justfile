@@ -27,6 +27,18 @@ lint:
 gen-fixtures *args:
   cargo run --quiet --package firepath-fixtures --bin gen-fixtures -- {{ args }}
 
+# Test if the `ledger` binary accepts the generated fixtures
+# Skips if ledger is not installed
+accept-ledger: gen-fixtures
+  #!/usr/bin/env bash
+  set -euo pipefail
+  if ! command -v ledger >/dev/null 2>&1; then
+    echo "ledger not installed, skipping acceptance test"
+    exit 0
+  fi
+  ledger --pedantic -f data/fixtures/main.ledger balance >/dev/null
+  echo "ledger accepts the generated fixtures"
+
 # Audit dependencies for advisories, licenses, duplicates, and sources
 deny:
   cargo deny check

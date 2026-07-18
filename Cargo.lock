@@ -296,6 +296,7 @@ name = "firepath-fixtures"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "firepath-ledger",
  "serde",
  "sha2",
  "toml",

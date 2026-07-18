@@ -26,8 +26,12 @@ pub(crate) const DEFAULT_WINDOW_END: &str = "2024-12-31";
 ///
 /// `hashes` are written only by `--pin`
 /// It is a `BTreeMap` so keys serialize in sorted order
+///
+/// Public so callers can build a fixture in memory, but its fields stay
+/// crate-visible: outside code hands [`Manifest::default`] to
+/// [`generate`](crate::generate), it does not assemble one field by field
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct Manifest {
+pub struct Manifest {
     /// Schema version of this manifest and the layout it produces
     pub(crate) schema_version: u32,
     /// Seed for the deterministic generator
