@@ -8,7 +8,9 @@
 
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+mod household;
 pub mod manifest;
+mod rng;
 
 use std::collections::BTreeMap;
 use std::error::Error;
