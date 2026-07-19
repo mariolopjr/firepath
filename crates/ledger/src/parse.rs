@@ -18,7 +18,7 @@ use crate::transaction::TransactionHeader;
 /// The parse never stops at the first error: each block is scanned on its own,
 /// so one malformed line does not hide the next. `file` tags the parse for when
 /// items carry it; today only errors are returned
-pub fn parse(file: FileId, source: &str) -> Vec<ParseError> {
+pub fn parse(file: FileId, source: &[u8]) -> Vec<ParseError> {
     let grouped = blocks(file, source);
     // Unassociated-indentation errors from grouping come first. Each block then adds
     // its own
@@ -56,7 +56,7 @@ pub fn parse(file: FileId, source: &str) -> Vec<ParseError> {
 /// header does not mask a bad posting below it. Every child is a posting for
 /// now. Inline comment and tag children get their own routing when that grammar
 /// is supported
-fn parse_transaction(source: &str, block: &Block, errors: &mut Vec<ParseError>) {
+fn parse_transaction(source: &[u8], block: &Block, errors: &mut Vec<ParseError>) {
     if let Err(err) = TransactionHeader::parse(slice(source, block.header), block.header.start()) {
         errors.push(err);
     }
@@ -67,8 +67,8 @@ fn parse_transaction(source: &str, block: &Block, errors: &mut Vec<ParseError>) 
     }
 }
 
-/// The text a span covers, empty for a span that does not land in `source`
-fn slice(source: &str, span: Span) -> &str {
+/// The bytes a span covers, empty for a span that does not land in `source`
+fn slice(source: &[u8], span: Span) -> &[u8] {
     source
         .get(span.start() as usize..span.end() as usize)
         .unwrap_or_default()
@@ -94,7 +94,7 @@ include 2020.ledger
     Expenses:Food    $50.00
     Assets:Checking
 ";
-        assert!(parse(FILE, src).is_empty());
+        assert!(parse(FILE, src.as_bytes()).is_empty());
     }
 
     #[test]
@@ -106,7 +106,7 @@ include 2020.ledger
         // Written with explicit newlines so the leading whitespace of the
         // indented lines survives the string literal
         let src = "    unassociated line\naccount Assets:Cash\n2020-13-01 Grocery\n    Expenses:Food    $\n";
-        let errors = parse(FILE, src);
+        let errors = parse(FILE, src.as_bytes());
         let mut messages: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
         messages.sort_unstable();
         let mut expected = vec![
@@ -124,33 +124,33 @@ include 2020.ledger
         // The bad date and the bad amount are both reported, proving the
         // postings are scanned even when the header fails
         let src = "2020-13-01 Grocery\n    Expenses:Food    $\n";
-        assert_eq!(parse(FILE, src).len(), 2);
+        assert_eq!(parse(FILE, src.as_bytes()).len(), 2);
     }
 
     #[test]
     fn a_posting_error_under_a_good_header_is_reported() {
         // A well-formed header, one malformed posting amount
         let src = "2020-01-02 Grocery\n    Expenses:Food    @@@\n";
-        let errors = parse(FILE, src);
+        let errors = parse(FILE, src.as_bytes());
         assert_eq!(errors.len(), 1);
         assert_eq!(errors.first().unwrap().message, "expected a commodity");
     }
 
     #[test]
     fn an_include_directive_is_accepted() {
-        assert!(parse(FILE, "include transactions/2020.ledger\n").is_empty());
+        assert!(parse(FILE, "include transactions/2020.ledger\n".as_bytes()).is_empty());
     }
 
     #[test]
     fn periodic_and_automated_blocks_are_refused() {
-        let periodic = parse(FILE, "~ monthly\n    Budget:Food    $400.00\n");
+        let periodic = parse(FILE, "~ monthly\n    Budget:Food    $400.00\n".as_bytes());
         assert_eq!(periodic.len(), 1);
         assert_eq!(
             periodic.first().unwrap().message,
             "periodic transactions are not supported yet"
         );
 
-        let automated = parse(FILE, "= /Food/\n    Budget:Food    $10.00\n");
+        let automated = parse(FILE, "= /Food/\n    Budget:Food    $10.00\n".as_bytes());
         assert_eq!(automated.len(), 1);
         assert_eq!(
             automated.first().unwrap().message,
@@ -163,11 +163,11 @@ include 2020.ledger
         // The region swallows transaction-shaped lines raw, so nothing inside
         // is scanned and no error is produced
         let src = "comment\n2020-13-01 not parsed at all\nend comment\n";
-        assert!(parse(FILE, src).is_empty());
+        assert!(parse(FILE, src.as_bytes()).is_empty());
     }
 
     #[test]
     fn an_empty_source_reports_no_errors() {
-        assert!(parse(FILE, "").is_empty());
+        assert!(parse(FILE, "".as_bytes()).is_empty());
     }
 }

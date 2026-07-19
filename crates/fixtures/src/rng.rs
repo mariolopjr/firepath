@@ -19,8 +19,8 @@ impl Rng {
     ///
     /// `seed_from_u64` is a fixed, portable expansion, so the same seed yields
     /// the same stream regardless of host
-    pub(crate) fn new(seed: u64) -> Self {
-        Self(Pcg32::seed_from_u64(seed))
+    pub(crate) fn new(seed: i64) -> Self {
+        Self(Pcg32::seed_from_u64(seed.cast_unsigned()))
     }
 
     /// Draw the next 32-bit value

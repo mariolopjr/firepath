@@ -62,8 +62,8 @@ impl Posting {
     /// # Errors
     /// A non-empty amount that does not scan errors with the amount scanner's
     /// message at the amount's span
-    pub fn parse(line: &str, base: u32) -> Result<Self, ParseError> {
-        let bytes = line.as_bytes();
+    pub fn parse(line: &[u8], base: u32) -> Result<Self, ParseError> {
+        let bytes = line;
         // Postings arrive indented under their transaction, so skip the
         // indentation to land the account span on the name
         let content_start = skip_ws(bytes, 0);
@@ -178,7 +178,7 @@ mod tests {
         account: &str,
         amount: Option<(&str, &str, Placement)>,
     ) {
-        let posting = Posting::parse(line, 0).unwrap();
+        let posting = Posting::parse(line.as_bytes(), 0).unwrap();
         assert_eq!(posting.kind, kind, "kind of {line:?}");
         assert_eq!(text(line, posting.account), account, "account of {line:?}");
         // The amount and its span are present together or absent together
@@ -196,7 +196,11 @@ mod tests {
             (amount, &posting.amount, posting.amount_span)
         {
             assert_eq!(got.quantity.to_string(), quantity, "quantity of {line:?}");
-            assert_eq!(got.commodity.symbol(), symbol, "symbol of {line:?}");
+            assert_eq!(
+                got.commodity.symbol(),
+                symbol.as_bytes(),
+                "symbol of {line:?}"
+            );
             assert_eq!(
                 got.commodity.placement(),
                 placement,
@@ -204,7 +208,7 @@ mod tests {
             );
             // The span covers exactly the amount and nothing else
             assert_eq!(
-                &Amount::parse(text(line, span)).unwrap(),
+                &Amount::parse(text(line, span).as_bytes()).unwrap(),
                 got,
                 "span of {line:?}"
             );
@@ -368,12 +372,12 @@ mod tests {
         // `    Expenses:Food    $50.00` at base 1000: the account is bytes
         // 4..17 of the line, the amount 21..27
         let line = "    Expenses:Food    $50.00";
-        let posting = Posting::parse(line, 1000).unwrap();
+        let posting = Posting::parse(line.as_bytes(), 1000).unwrap();
         assert_eq!(posting.account, Span::new(1004, 1017));
         assert_eq!(posting.amount_span, Some(Span::new(1021, 1027)));
 
         // A virtual account's span is the bracket interior, still shifted
-        let posting = Posting::parse("  [Assets:Cash]  $1", 1000).unwrap();
+        let posting = Posting::parse("  [Assets:Cash]  $1".as_bytes(), 1000).unwrap();
         assert_eq!(posting.account, Span::new(1003, 1014));
     }
 
@@ -382,18 +386,18 @@ mod tests {
         // A commodity with no number errors where the number should be, an
         // empty span one byte past the `$` at offset 21. The empty span widens
         // back over the `$` so an editor can show it, and shifts file-absolute
-        let err = Posting::parse("    Expenses:Food    $", 0).unwrap_err();
+        let err = Posting::parse("    Expenses:Food    $".as_bytes(), 0).unwrap_err();
         assert_eq!(err.message, "expected a number");
         assert_eq!(err.span, Span::new(21, 22));
 
         // The same amount at a nonzero base shifts by the base
-        let err = Posting::parse("    Expenses:Food    $", 1000).unwrap_err();
+        let err = Posting::parse("    Expenses:Food    $".as_bytes(), 1000).unwrap_err();
         assert_eq!(err.message, "expected a number");
         assert_eq!(err.span, Span::new(1021, 1022));
 
         // Leftover text after the amount is the amount scanner's error, so a
         // cost annotation reads as malformed until its wave lands
-        let err = Posting::parse("    Assets:Broker  5 VTI @ $10", 0).unwrap_err();
+        let err = Posting::parse("    Assets:Broker  5 VTI @ $10".as_bytes(), 0).unwrap_err();
         assert_eq!(err.message, "unexpected characters after the amount");
     }
 }

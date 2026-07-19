@@ -31,13 +31,11 @@ pub struct LineIndex {
 }
 
 impl LineIndex {
-    /// Build the index for a source string
-    pub fn new(source: &str) -> Self {
+    /// Build the index for a source
+    pub fn new(source: &[u8]) -> Self {
         let mut newlines = Vec::new();
         // try_from drops any newlines past u32::MAX
-        newlines.extend(
-            memchr::memchr_iter(b'\n', source.as_bytes()).filter_map(|nl| u32::try_from(nl).ok()),
-        );
+        newlines.extend(memchr::memchr_iter(b'\n', source).filter_map(|nl| u32::try_from(nl).ok()));
         Self { newlines }
     }
 
@@ -104,7 +102,7 @@ mod tests {
     #[test]
     fn line_col_locates_offsets_across_lines() {
         // offsets: a0 b1 c2 \n3 d4 e5 f6 \n7, line starts at 0, 4, 8
-        let index = LineIndex::new("abc\ndef\n");
+        let index = LineIndex::new(b"abc\ndef\n");
         assert_eq!(index.line_col(0), lc(1, 1)); // byte 0 is 'a'
         assert_eq!(index.line_col(1), lc(1, 2)); // byte 1 is 'b'
         // byte 3 is '\n', the last column of its own line
@@ -117,7 +115,7 @@ mod tests {
     fn columns_count_bytes_not_chars() {
         // é is two bytes, so the byte after it lands in column three, and the
         // \r of a CRLF ending is a column of its own line
-        let index = LineIndex::new("é.\r\nx");
+        let index = LineIndex::new("é.\r\nx".as_bytes());
         assert_eq!(index.line_col(2), lc(1, 3)); // the dot after the two-byte é
         assert_eq!(index.line_col(3), lc(1, 4)); // the \r itself
         assert_eq!(index.line_col(5), lc(2, 1)); // x, first byte after the CRLF
@@ -125,7 +123,7 @@ mod tests {
 
     #[test]
     fn an_offset_past_the_end_resolves_against_the_last_line() {
-        let index = LineIndex::new("abc\ndef\n");
+        let index = LineIndex::new(b"abc\ndef\n");
         // offset 8 is one past the final newline, on the empty trailing line
         assert_eq!(index.line_col(8), lc(3, 1));
     }
@@ -139,12 +137,12 @@ mod tests {
         // Guards the partition_point lookup against the straightforward count it
         // replaced, across every offset of a source with uneven line lengths and
         // both an empty line and a trailing one
-        let source = "abc\n\nde\nfghi\n\nj\n";
+        let source = b"abc\n\nde\nfghi\n\nj\n";
         let index = LineIndex::new(source);
         for offset in 0..=u32::try_from(source.len()).unwrap() {
             let mut line = 1usize;
             let mut line_start = 0u32;
-            for (nl, byte) in source.bytes().enumerate() {
+            for (nl, &byte) in source.iter().enumerate() {
                 let nl = u32::try_from(nl).unwrap();
                 if byte == b'\n' && nl < offset {
                     line += 1;
@@ -161,13 +159,13 @@ mod tests {
 
     #[test]
     fn an_empty_source_has_one_line() {
-        let index = LineIndex::new("");
+        let index = LineIndex::new(b"");
         assert_eq!(index.line_col(0), lc(1, 1));
     }
 
     #[test]
     fn an_error_renders_as_file_line_col_message() {
-        let index = LineIndex::new("abc\ndef\n");
+        let index = LineIndex::new(b"abc\ndef\n");
         let error = ParseError::new("unexpected token", Span::new(5, 6));
         assert_eq!(
             error.render("ledgers/main.ledger", &index),

@@ -22,7 +22,7 @@ fn every_generated_file_parses_without_error() {
 
     for (index, (name, body)) in files.iter().enumerate() {
         let file = FileId::new(u32::try_from(index).expect("few enough files for a u32 id"));
-        let errors = parse(file, body);
+        let errors = parse(file, body.as_bytes());
         let messages: Vec<&String> = errors.iter().map(|e| &e.message).collect();
         assert!(
             errors.is_empty(),
@@ -42,7 +42,7 @@ fn a_bad_emitted_line_fails() {
         .clone();
     body.push_str("account Assets:Cash\n");
 
-    let errors = parse(FileId::new(0), &body);
+    let errors = parse(FileId::new(0), body.as_bytes());
     assert!(
         !errors.is_empty(),
         "a bad line slipped through the acceptance test silently"

@@ -259,27 +259,25 @@ mod tests {
         Args, Manifest, Paths, generate, hashes_of, run, sha256_hex, verify, workspace_paths,
         write_manifest,
     };
+    use crate::manifest::DEFAULT_SEED;
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
 
-    // A new, uniquely named scratch dir per test, so parallel tests do not
-    // collide
-    fn temp_paths(tag: &str) -> Paths {
-        let mut dir = std::env::temp_dir();
-        dir.push(format!("firepath-fixtures-{}-{tag}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        Paths {
-            manifest: dir.join("manifest.toml"),
-            data_dir: dir.join("data"),
-        }
-    }
-
-    fn cleanup(paths: &Paths) {
-        if let Some(parent) = paths.manifest.parent() {
-            let _ = fs::remove_dir_all(parent);
-        }
+    // A fresh scratch dir per test, created with a random name so a pre-planted
+    // path cannot be used to redirect a write, and removed when the handle
+    // drops, including when a test panics
+    //
+    // The handle is returned alongside the paths because dropping it deletes
+    // the directory, so the caller has to hold it for the length of the test
+    fn temp_paths() -> (TempDir, Paths) {
+        let dir = TempDir::new().unwrap();
+        let paths = Paths {
+            manifest: dir.path().join("manifest.toml"),
+            data_dir: dir.path().join("data"),
+        };
+        (dir, paths)
     }
 
     fn data_file(paths: &Paths) -> PathBuf {
@@ -315,7 +313,7 @@ mod tests {
 
     #[test]
     fn an_unsupported_schema_version_is_rejected() {
-        let paths = temp_paths("schema");
+        let (_dir, paths) = temp_paths();
         run(&paths, true).unwrap();
 
         // Bump the schema past what this build knows how to produce
@@ -326,8 +324,6 @@ mod tests {
 
         let err = run(&paths, false).unwrap_err();
         assert!(err.to_string().contains("schema version"));
-
-        cleanup(&paths);
     }
 
     #[test]
@@ -432,17 +428,137 @@ mod tests {
 
     #[test]
     fn a_manifest_that_is_not_a_file_surfaces_the_io_error() {
-        let paths = temp_paths("ioerr");
+        let (_dir, paths) = temp_paths();
         // A directory where the manifest should be makes the read fail with
         // something other than NotFound
         fs::create_dir_all(&paths.manifest).unwrap();
         assert!(run(&paths, false).is_err());
-        cleanup(&paths);
+    }
+
+    #[test]
+    fn every_seed_the_manifest_can_hold_round_trips_through_toml() {
+        for seed in [i64::MIN, -1, 0, DEFAULT_SEED, i64::MAX] {
+            let manifest = Manifest {
+                seed,
+                ..Manifest::default()
+            };
+            let text = toml::to_string(&manifest).unwrap();
+            let back: Manifest = toml::from_str(&text).unwrap();
+            assert_eq!(back.seed, seed);
+        }
+    }
+
+    #[test]
+    fn a_manifest_that_is_not_valid_toml_surfaces_the_parse_error() {
+        // A corrupt manifest must stop the run. Falling back to the defaults
+        // here would silently re-pin against the in-code window and lose
+        // whatever the file was meant to say
+        let (_dir, paths) = temp_paths();
+        fs::write(&paths.manifest, "this is not = = toml").unwrap();
+        assert!(run(&paths, false).is_err());
+    }
+
+    #[test]
+    fn a_manifest_window_that_cannot_generate_stops_the_run() {
+        // The generate failure has to propagate out of run rather than leaving
+        // a half-written pin behind
+        let (_dir, paths) = temp_paths();
+        let manifest = Manifest {
+            window_start: "2024-01-01".to_owned(),
+            window_end: "2015-12-31".to_owned(),
+            ..Manifest::default()
+        };
+        write_manifest(&paths.manifest, &manifest).unwrap();
+
+        let err = run(&paths, true).unwrap_err().to_string();
+        assert!(err.contains("precedes"), "{err}");
+    }
+
+    #[test]
+    fn a_fixtures_dir_that_cannot_be_created_fails_the_pin() {
+        // A regular file where the fixtures directory belongs makes the
+        // directory creation fail. Pinning must report that rather than
+        // recording hashes for output it never wrote
+        let (_dir, paths) = temp_paths();
+        let file_in_the_way = paths.data_dir.parent().unwrap().join("blocker");
+        fs::write(&file_in_the_way, "not a directory").unwrap();
+        let blocked = Paths {
+            manifest: paths.manifest.clone(),
+            data_dir: file_in_the_way.join("fixtures"),
+        };
+
+        assert!(run(&blocked, true).is_err());
+    }
+
+    #[test]
+    fn a_fixture_path_blocked_by_a_directory_fails_the_write() {
+        // The parent creates fine but the file itself cannot be written,
+        // because a directory already sits on its name
+        let (_dir, paths) = temp_paths();
+        fs::create_dir_all(&paths.data_dir).unwrap();
+        fs::create_dir_all(data_file(&paths)).unwrap();
+
+        assert!(run(&paths, true).is_err());
+    }
+
+    #[test]
+    fn a_verified_run_still_reports_a_failed_write() {
+        // Verification passing is not the end of the run: the output is written
+        // afterwards, and a failure there must not report success
+        let (_dir, paths) = temp_paths();
+        run(&paths, true).unwrap();
+
+        // The manifest now has hashes that match, so the run reaches the write
+        let file_in_the_way = paths.data_dir.parent().unwrap().join("blocker");
+        fs::write(&file_in_the_way, "not a directory").unwrap();
+        let blocked = Paths {
+            manifest: paths.manifest.clone(),
+            data_dir: file_in_the_way.join("fixtures"),
+        };
+
+        assert!(run(&blocked, false).is_err());
+    }
+
+    // A manifest path that reads as absent but cannot be written: a symlink
+    // pointing into a directory that does not exist. The read follows it and
+    // reports NotFound, so the run takes the missing-manifest path, and the
+    // write follows it and fails on the missing parent
+    #[cfg(unix)]
+    fn unwritable_manifest(paths: &Paths) -> PathBuf {
+        let link = paths.manifest.with_file_name("dangling.toml");
+        std::os::unix::fs::symlink(paths.data_dir.join("gone").join("m.toml"), &link).unwrap();
+        link
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_manifest_that_cannot_be_written_fails_the_pin() {
+        let (_dir, paths) = temp_paths();
+        let blocked = Paths {
+            manifest: unwritable_manifest(&paths),
+            data_dir: paths.data_dir.clone(),
+        };
+
+        assert!(run(&blocked, true).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_manifest_that_cannot_be_recreated_fails_the_run() {
+        // The verify path recreates an absent manifest before it checks hashes,
+        // so a failure to write it stops the run there
+        let (_dir, paths) = temp_paths();
+        let blocked = Paths {
+            manifest: unwritable_manifest(&paths),
+            data_dir: paths.data_dir.clone(),
+        };
+
+        assert!(run(&blocked, false).is_err());
     }
 
     #[test]
     fn pin_writes_hashes_then_verify_roundtrips() {
-        let paths = temp_paths("roundtrip");
+        let (_dir, paths) = temp_paths();
 
         // No manifest yet, so pinning creates it, records hashes, and writes output
         run(&paths, true).unwrap();
@@ -455,13 +571,11 @@ mod tests {
         run(&paths, false).unwrap();
         let second = fs::read(data_file(&paths)).unwrap();
         assert_eq!(first, second);
-
-        cleanup(&paths);
     }
 
     #[test]
     fn deleting_the_manifest_restores_the_pinned_window() {
-        let paths = temp_paths("restore");
+        let (_dir, paths) = temp_paths();
         run(&paths, true).unwrap();
         fs::remove_file(&paths.manifest).unwrap();
 
@@ -474,13 +588,11 @@ mod tests {
         assert!(manifest_text.contains("2024-12-31"));
         // Recreated without hashes, pinning stays a deliberate step
         assert!(!manifest_text.contains("[hashes]"));
-
-        cleanup(&paths);
     }
 
     #[test]
     fn a_drifted_input_fails_verification_until_repinned() {
-        let paths = temp_paths("drift");
+        let (_dir, paths) = temp_paths();
         run(&paths, true).unwrap();
 
         // Change an input so generation drifts from the pinned hashes
@@ -495,7 +607,5 @@ mod tests {
         // Only pinning clears it
         run(&paths, true).unwrap();
         run(&paths, false).unwrap();
-
-        cleanup(&paths);
     }
 }

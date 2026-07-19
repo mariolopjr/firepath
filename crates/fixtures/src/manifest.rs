@@ -15,7 +15,7 @@ pub(crate) const SCHEMA_VERSION: u32 = 1;
 
 /// Fixed seed so every run reproduces the same fixtures. Changing
 /// it re-rolls every generated value
-pub(crate) const DEFAULT_SEED: u64 = 42;
+pub(crate) const DEFAULT_SEED: i64 = 42;
 
 /// Window bounds pinned in code
 pub(crate) const DEFAULT_WINDOW_START: &str = "2015-01-01";
@@ -35,7 +35,7 @@ pub struct Manifest {
     /// Schema version of this manifest and the layout it produces
     pub(crate) schema_version: u32,
     /// Seed for the deterministic generator
-    pub(crate) seed: u64,
+    pub(crate) seed: i64,
     /// Inclusive ISO-8601 window start
     pub(crate) window_start: String,
     /// Inclusive ISO-8601 window end
@@ -118,11 +118,19 @@ mod tests {
     }
 
     #[test]
-    fn years_reject_a_nonnumeric_year() {
-        let manifest = Manifest {
+    fn years_reject_a_nonnumeric_year_at_either_end() {
+        let start = Manifest {
             window_start: "not-a-date".to_owned(),
             ..Manifest::default()
         };
-        assert!(manifest.years().is_err());
+        let err = start.years().unwrap_err().to_string();
+        assert!(err.contains("not-a-date"), "{err}");
+
+        let end = Manifest {
+            window_end: "also-not-a-date".to_owned(),
+            ..Manifest::default()
+        };
+        let err = end.years().unwrap_err().to_string();
+        assert!(err.contains("also-not-a-date"), "{err}");
     }
 }

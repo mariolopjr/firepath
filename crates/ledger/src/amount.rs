@@ -14,6 +14,7 @@ use crate::error::ParseError;
 use crate::span::{Span, clamp_u32};
 use rust_decimal::Decimal;
 use std::fmt;
+use std::io;
 
 /// Which side of the number the commodity is written on
 ///
@@ -57,7 +58,7 @@ pub struct Commodity {
     // The symbol with any surrounding quotes stripped. Quoting is recomputed
     // from the content when formatting, so an input that quotes a symbol
     // needing no quotes still round-trips to an equal value
-    symbol: String,
+    symbol: Vec<u8>,
     placement: Placement,
 }
 
@@ -69,7 +70,7 @@ impl Commodity {
     /// an empty symbol formats to nothing, a quote has no escape in the
     /// grammar, and a control byte would corrupt the single-line journal, so
     /// any of them would keep the commodity from formatting back to itself
-    pub fn new(symbol: impl Into<String>, placement: Placement) -> Result<Self, SymbolError> {
+    pub fn new(symbol: impl Into<Vec<u8>>, placement: Placement) -> Result<Self, SymbolError> {
         let symbol = symbol.into();
         if symbol_round_trips(&symbol) {
             Ok(Self { symbol, placement })
@@ -80,7 +81,7 @@ impl Commodity {
 
     /// A commodity scanned out of an amount. The scanner already refused the
     /// symbols [`new`](Commodity::new) rejects, so this cannot fail
-    fn scanned(symbol: String, placement: Placement) -> Self {
+    fn scanned(symbol: Vec<u8>, placement: Placement) -> Self {
         debug_assert!(
             symbol_round_trips(&symbol),
             "scanner let through a symbol that cannot round-trip: {symbol:?}"
@@ -88,26 +89,51 @@ impl Commodity {
         Self { symbol, placement }
     }
 
-    /// The symbol text, without surrounding quotes
-    pub fn symbol(&self) -> &str {
+    /// The symbol bytes, without surrounding quotes
+    pub fn symbol(&self) -> &[u8] {
         &self.symbol
+    }
+
+    /// The symbol as text, `None` when it is not valid UTF-8
+    ///
+    /// For a caller that needs a `&str` and has somewhere to put the refusal.
+    pub fn symbol_str(&self) -> Option<&str> {
+        std::str::from_utf8(&self.symbol).ok()
     }
 
     /// Which side of the number the commodity sits on
     pub fn placement(&self) -> Placement {
         self.placement
     }
+
+    /// Write the symbol back byte for byte, quoted when a bare symbol would not
+    /// scan again as one token
+    ///
+    /// # Errors
+    /// Whatever `out` returns
+    pub fn write_to(&self, out: &mut impl io::Write) -> io::Result<()> {
+        if needs_quotes(&self.symbol) {
+            out.write_all(b"\"")?;
+            out.write_all(&self.symbol)?;
+            out.write_all(b"\"")
+        } else {
+            out.write_all(&self.symbol)
+        }
+    }
 }
 
 impl fmt::Display for Commodity {
+    /// Lossy on a symbol that is not UTF-8: every invalid sequence becomes
+    /// U+FFFD. Use [`write_to`](Commodity::write_to) to write a journal
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Quote only when the bare symbol would not scan back as one token: one
         // holding whitespace, a digit, or a character that ends an unquoted
         // symbol
+        let symbol = String::from_utf8_lossy(&self.symbol);
         if needs_quotes(&self.symbol) {
-            write!(f, "\"{}\"", self.symbol)
+            write!(f, "\"{symbol}\"")
         } else {
-            f.write_str(&self.symbol)
+            f.write_str(&symbol)
         }
     }
 }
@@ -118,15 +144,24 @@ impl fmt::Display for Commodity {
 /// Carries the rejected symbol so the message names it
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolError {
-    symbol: String,
+    symbol: Vec<u8>,
+}
+
+impl SymbolError {
+    /// The rejected symbol, as it was given
+    pub fn symbol(&self) -> &[u8] {
+        &self.symbol
+    }
 }
 
 impl fmt::Display for SymbolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The symbol is rendered lossily: this is a message, and a symbol that
+        // is not text is exactly one of the shapes that lands here
         write!(
             f,
             "commodity symbol must be nonempty with no quote or control byte: {:?}",
-            self.symbol
+            String::from_utf8_lossy(&self.symbol)
         )
     }
 }
@@ -153,7 +188,7 @@ impl Amount {
     ///
     /// # Errors
     /// See [`parse_styled`](Amount::parse_styled)
-    pub fn parse(src: &str) -> Result<Self, ParseError> {
+    pub fn parse(src: &[u8]) -> Result<Self, ParseError> {
         Self::parse_styled(src, DecimalStyle::Period)
     }
 
@@ -176,7 +211,7 @@ impl Amount {
     /// inside a quoted commodity, a missing number or commodity, more than one
     /// sign, malformed thousands grouping, a quantity too large or too precise
     /// for [`Decimal`], or characters left over after the amount
-    pub fn parse_styled(src: &str, style: DecimalStyle) -> Result<Self, ParseError> {
+    pub fn parse_styled(src: &[u8], style: DecimalStyle) -> Result<Self, ParseError> {
         let mut s = Scanner::new(src);
         let (_, decimal) = style.marks();
 
@@ -251,42 +286,67 @@ impl Amount {
     }
 }
 
-impl fmt::Display for Amount {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The sign lives in the number, so a negative prefix amount prints as
-        // `$-5.00`, which scans back to the same value. The canonical form drops
-        // thousands grouping, so the comma style differs only in swapping the one
-        // decimal dot for a comma
+impl Amount {
+    /// The quantity in its own style: digits and at most one mark, the decimal
+    /// mark written as this amount's style writes it
+    ///
+    /// The canonical form drops thousands grouping, so the comma style differs
+    /// from the period style only in swapping the one decimal dot for a comma
+    fn quantity_text(&self) -> String {
         match self.style {
-            DecimalStyle::Period => match self.commodity.placement {
-                Placement::Prefix => write!(f, "{}{}", self.commodity, self.quantity),
-                Placement::Suffix => write!(f, "{} {}", self.quantity, self.commodity),
-            },
-            DecimalStyle::Comma => {
-                let number = self.quantity.to_string().replace('.', ",");
-                match self.commodity.placement {
-                    Placement::Prefix => write!(f, "{}{number}", self.commodity),
-                    Placement::Suffix => write!(f, "{number} {}", self.commodity),
-                }
+            DecimalStyle::Period => self.quantity.to_string(),
+            DecimalStyle::Comma => self.quantity.to_string().replace('.', ","),
+        }
+    }
+
+    /// Write the amount back byte for byte, the commodity on the side it was
+    /// read from
+    ///
+    /// The byte-exact counterpart to [`Display`](fmt::Display), which is lossy
+    /// on a commodity symbol that is not UTF-8. A journal is written through
+    /// this
+    ///
+    /// # Errors
+    /// Whatever `out` returns
+    pub fn write_to(&self, out: &mut impl io::Write) -> io::Result<()> {
+        // The sign lives in the number, so a negative prefix amount writes as
+        // `$-5.00`, which scans back to the same value
+        let number = self.quantity_text();
+        match self.commodity.placement {
+            Placement::Prefix => {
+                self.commodity.write_to(out)?;
+                out.write_all(number.as_bytes())
             }
+            Placement::Suffix => {
+                out.write_all(number.as_bytes())?;
+                out.write_all(b" ")?;
+                self.commodity.write_to(out)
+            }
+        }
+    }
+}
+
+impl fmt::Display for Amount {
+    /// Lossy on a commodity symbol that is not UTF-8. Use
+    /// [`write_to`](Amount::write_to) to write a journal
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let number = self.quantity_text();
+        match self.commodity.placement {
+            Placement::Prefix => write!(f, "{}{number}", self.commodity),
+            Placement::Suffix => write!(f, "{number} {}", self.commodity),
         }
     }
 }
 
 /// A byte cursor over the amount source
 struct Scanner<'a> {
-    src: &'a str,
     bytes: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Scanner<'a> {
-    fn new(src: &'a str) -> Self {
-        Self {
-            src,
-            bytes: src.as_bytes(),
-            pos: 0,
-        }
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
     }
 
     fn peek(&self) -> Option<u8> {
@@ -430,7 +490,7 @@ impl<'a> Scanner<'a> {
     }
 
     /// Scan a commodity symbol, quoted or bare, returning it without quotes
-    fn take_commodity(&mut self) -> Result<String, ParseError> {
+    fn take_commodity(&mut self) -> Result<Vec<u8>, ParseError> {
         match self.peek() {
             Some(b'"') => {
                 let open = self.pos;
@@ -480,15 +540,10 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    fn slice(&self, start: usize, end: usize) -> String {
-        // Start and end come from the cursor, so they land on char boundaries.
-        // The debug assert trips if a later change breaks that invariant, and
-        // the release fallback still degrades to empty rather than an unwrap
-        debug_assert!(
-            self.src.get(start..end).is_some(),
-            "slice {start}..{end} is not on a char boundary"
-        );
-        self.src.get(start..end).unwrap_or_default().to_string()
+    fn slice(&self, start: usize, end: usize) -> Vec<u8> {
+        // Start and end come from the cursor, so they are in bounds. The release
+        // fallback still degrades to empty rather than an unwrap
+        self.bytes.get(start..end).unwrap_or_default().to_vec()
     }
 
     /// A span from `start` to the cursor
@@ -535,8 +590,8 @@ fn is_commodity_byte(b: u8) -> bool {
 /// Whether a symbol must be quoted to scan back as one token
 ///
 /// The symbol is nonempty, the [`Commodity`] constructor's contract
-fn needs_quotes(symbol: &str) -> bool {
-    symbol.bytes().any(|b| !is_commodity_byte(b))
+fn needs_quotes(symbol: &[u8]) -> bool {
+    symbol.iter().any(|&b| !is_commodity_byte(b))
 }
 
 /// Whether a symbol can format back and scan again as the same one token
@@ -545,8 +600,8 @@ fn needs_quotes(symbol: &str) -> bool {
 /// to nothing, a `"` has no escape, and an ASCII control byte would corrupt
 /// the single-line journal, so a symbol that is empty or holds either cannot
 /// round-trip
-fn symbol_round_trips(symbol: &str) -> bool {
-    !symbol.is_empty() && !symbol.bytes().any(|b| b == b'"' || b.is_ascii_control())
+fn symbol_round_trips(symbol: &[u8]) -> bool {
+    !symbol.is_empty() && !symbol.iter().any(|&b| b == b'"' || b.is_ascii_control())
 }
 
 /// Whether a byte starts a number: a digit, or the decimal mark for a leading
@@ -582,13 +637,17 @@ mod tests {
         placement: Placement,
         style: DecimalStyle,
     ) {
-        let amount = Amount::parse_styled(input, style).unwrap();
+        let amount = Amount::parse_styled(input.as_bytes(), style).unwrap();
         assert_eq!(
             amount.quantity.to_string(),
             quantity,
             "quantity of {input:?}"
         );
-        assert_eq!(amount.commodity.symbol(), symbol, "symbol of {input:?}");
+        assert_eq!(
+            amount.commodity.symbol(),
+            symbol.as_bytes(),
+            "symbol of {input:?}"
+        );
         assert_eq!(
             amount.commodity.placement(),
             placement,
@@ -596,13 +655,133 @@ mod tests {
         );
         assert_eq!(amount.style, style, "style of {input:?}");
 
-        let reparsed = Amount::parse_styled(&amount.to_string(), style).unwrap();
+        // The round-trip goes through write_to, the byte-exact output path a
+        // journal is written with, not through the lossy Display
+        let mut written = Vec::new();
+        amount.write_to(&mut written).unwrap();
+        let reparsed = Amount::parse_styled(&written, style).unwrap();
         assert_eq!(
             reparsed,
             amount,
             "round-trip of {input:?} via {:?}",
-            amount.to_string()
+            String::from_utf8_lossy(&written)
         );
+    }
+
+    // Write an amount through the byte-exact path and hand back the bytes
+    fn written(amount: &Amount) -> Vec<u8> {
+        let mut buf = [0u8; 64];
+        let capacity = buf.len();
+        let free = {
+            let mut out: &mut [u8] = &mut buf;
+            amount.write_to(&mut out).unwrap();
+            out.len()
+        };
+        buf.get(..capacity.saturating_sub(free))
+            .unwrap_or_default()
+            .to_vec()
+    }
+
+    #[test]
+    fn a_commodity_symbol_that_is_not_utf8_survives_a_round_trip() {
+        // `caf\xe9` is Latin-1, which the ledger binary accepts and never
+        // decodes. The symbol must come back byte for byte, not as U+FFFD
+        let src: &[u8] = b"3 caf\xe9";
+        let amount = Amount::parse(src).unwrap();
+        assert_eq!(amount.commodity.symbol(), b"caf\xe9");
+        assert_eq!(amount.commodity.symbol_str(), None);
+        assert_eq!(written(&amount), src);
+        assert_eq!(Amount::parse(&written(&amount)).unwrap(), amount);
+    }
+
+    #[test]
+    fn display_is_lossy_where_write_to_is_exact() {
+        // Pins the split the two output paths make. Display is for messages and
+        // replaces the invalid byte, write_to is what a journal is written with
+        let amount = Amount::parse(b"3 caf\xe9").unwrap();
+        assert_eq!(amount.to_string(), "3 caf\u{fffd}");
+        assert_eq!(written(&amount), b"3 caf\xe9");
+    }
+
+    #[test]
+    fn a_quoted_symbol_that_is_not_utf8_keeps_its_quotes() {
+        // A high byte does not need quoting on its own, but a space does, and
+        // the quoting decision is made on bytes
+        let amount = Amount::parse(b"3 \"caf\xe9 au lait\"").unwrap();
+        assert_eq!(amount.commodity.symbol(), b"caf\xe9 au lait");
+        assert_eq!(written(&amount), b"3 \"caf\xe9 au lait\"");
+        assert_eq!(Amount::parse(&written(&amount)).unwrap(), amount);
+    }
+
+    #[test]
+    fn display_renders_each_placement_and_quotes_the_same_symbols_write_to_does() {
+        // Display and write_to are separate implementations of one format, so
+        // they can drift. This pins Display's own output and asserts the two
+        // agree byte for byte wherever the symbol is text
+        for src in [
+            &b"$5.00"[..],        // prefix, bare
+            b"5.00 VTI",          // suffix, bare
+            b"3 \"MUTF: VFIAX\"", // suffix, quoted for the space
+            b"-$5.00",            // the sign rides the number
+        ] {
+            let amount = Amount::parse(src).unwrap();
+            assert_eq!(
+                amount.to_string().as_bytes(),
+                written(&amount),
+                "Display and write_to disagree on {:?}",
+                String::from_utf8_lossy(src)
+            );
+        }
+
+        // The rendered text itself, so a change to either path has to be
+        // deliberate rather than silently agreed on by both
+        assert_eq!(Amount::parse(b"$5.00").unwrap().to_string(), "$5.00");
+        assert_eq!(Amount::parse(b"5.00 VTI").unwrap().to_string(), "5.00 VTI");
+        assert_eq!(
+            Amount::parse(b"3 \"MUTF: VFIAX\"").unwrap().to_string(),
+            "3 \"MUTF: VFIAX\""
+        );
+    }
+
+    #[test]
+    fn a_writer_that_runs_out_of_room_surfaces_the_error() {
+        // A `&mut [u8]` is a writer with a fixed capacity: once full, write_all
+        // returns WriteZero, so sizing the buffer picks which write fails
+        for (src, capacity, failing_write) in [
+            (&b"\"a b\"5"[..], 0, "the opening quote of a quoted symbol"),
+            (b"\"a b\"5", 1, "the symbol inside its quotes"),
+            (b"$5", 0, "a bare prefix symbol"),
+            (b"5 VTI", 0, "the number of a suffix amount"),
+            (b"5 VTI", 1, "the space between number and suffix symbol"),
+        ] {
+            let amount = Amount::parse(src).unwrap();
+            let mut buf = vec![0u8; capacity];
+            let mut out: &mut [u8] = &mut buf;
+            let err = amount.write_to(&mut out).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::WriteZero,
+                "writing {failing_write} of {:?} should fail",
+                String::from_utf8_lossy(src)
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_symbol_is_handed_back_as_the_bytes_that_were_given() {
+        // The constructor refuses a symbol that cannot format back and scan
+        // again. The error carries the offending bytes verbatim, so a caller
+        // can report the symbol it actually passed rather than a lossy
+        // rendering of it
+        let err = Commodity::new(b"ca\xe9\"fe".to_vec(), Placement::Suffix).unwrap_err();
+        assert_eq!(err.symbol(), b"ca\xe9\"fe");
+        // The message is text, so it renders the invalid byte lossily
+        assert!(err.to_string().contains('\u{fffd}'), "{err}");
+
+        // An empty symbol is refused for a different reason and reports as the
+        // empty bytes it was given, not as a missing symbol
+        let err = Commodity::new(Vec::new(), Placement::Prefix).unwrap_err();
+        assert_eq!(err.symbol(), b"");
     }
 
     #[test]
@@ -667,7 +846,7 @@ mod tests {
             ("$,5", MISPLACED),       // leading comma
             ("$1234,000", MISPLACED), // first group longer than three digits
         ] {
-            let err = Amount::parse(input).unwrap_err();
+            let err = Amount::parse(input.as_bytes()).unwrap_err();
             assert_eq!(err.message, message, "error for {input:?}");
         }
     }
@@ -711,7 +890,7 @@ mod tests {
     fn european_amount_formats_back_with_a_comma() {
         // The style is kept so the amount prints in the style it was read in,
         // and grouping still drops out of the canonical form
-        let amount = Amount::parse_styled("1.234,56 EUR", DecimalStyle::Comma).unwrap();
+        let amount = Amount::parse_styled("1.234,56 EUR".as_bytes(), DecimalStyle::Comma).unwrap();
         assert_eq!(amount.to_string(), "1234,56 EUR");
     }
 
@@ -719,8 +898,8 @@ mod tests {
     fn the_same_digits_differ_by_style() {
         // `1,000` is a thousands group under the period style and a comma decimal
         // under the comma style, so the caller's choice decides the value
-        let anglo = Amount::parse_styled("1,000 X", DecimalStyle::Period).unwrap();
-        let euro = Amount::parse_styled("1,000 X", DecimalStyle::Comma).unwrap();
+        let anglo = Amount::parse_styled("1,000 X".as_bytes(), DecimalStyle::Period).unwrap();
+        let euro = Amount::parse_styled("1,000 X".as_bytes(), DecimalStyle::Comma).unwrap();
         assert_eq!(anglo.quantity.to_string(), "1000");
         assert_eq!(euro.quantity.to_string(), "1.000");
     }
@@ -736,7 +915,7 @@ mod tests {
             ("€5.", THREE),        // trailing separator
             ("€.5", MISPLACED),    // leading separator
         ] {
-            let err = Amount::parse_styled(input, DecimalStyle::Comma).unwrap_err();
+            let err = Amount::parse_styled(input.as_bytes(), DecimalStyle::Comma).unwrap_err();
             assert_eq!(err.message, message, "error for {input:?}");
         }
     }
@@ -755,8 +934,8 @@ mod tests {
     fn quotes_are_dropped_when_not_needed() {
         // An input may quote a symbol that needs none, the value is unchanged
         // and the canonical form drops the quotes
-        let amount = Amount::parse("5 \"VTI\"").unwrap();
-        assert_eq!(amount.commodity.symbol(), "VTI");
+        let amount = Amount::parse("5 \"VTI\"".as_bytes()).unwrap();
+        assert_eq!(amount.commodity.symbol(), b"VTI");
         assert_eq!(amount.to_string(), "5 VTI");
     }
 
@@ -764,41 +943,41 @@ mod tests {
     fn unterminated_quote_errors_at_the_quote() {
         // The quote opens at byte 2 (`5`, space, then `"`) and the error spans
         // from there to the end of input
-        let err = Amount::parse("5 \"MUTF: VFIAX").unwrap_err();
+        let err = Amount::parse("5 \"MUTF: VFIAX".as_bytes()).unwrap_err();
         assert_eq!(err.message, "unterminated commodity quote");
         assert_eq!(err.span, Span::new(2, 14));
     }
 
     #[test]
     fn an_empty_input_is_an_error() {
-        let err = Amount::parse("").unwrap_err();
+        let err = Amount::parse("".as_bytes()).unwrap_err();
         assert_eq!(err.message, "expected an amount");
         assert_eq!(err.span, Span::new(0, 0));
         // A lone sign runs out of input the same way, spanning the sign
-        let err = Amount::parse("-").unwrap_err();
+        let err = Amount::parse("-".as_bytes()).unwrap_err();
         assert_eq!(err.message, "expected an amount");
         assert_eq!(err.span, Span::new(0, 1));
     }
 
     #[test]
     fn a_missing_commodity_is_an_error() {
-        let err = Amount::parse("5").unwrap_err();
+        let err = Amount::parse("5".as_bytes()).unwrap_err();
         assert_eq!(err.message, "expected a commodity");
     }
 
     #[test]
     fn a_grammar_byte_where_the_commodity_belongs_is_an_error() {
         // `@` ends a bare symbol, so it cannot start one, in either position
-        let err = Amount::parse("5 @").unwrap_err();
+        let err = Amount::parse("5 @".as_bytes()).unwrap_err();
         assert_eq!(err.message, "expected a commodity");
-        let err = Amount::parse("@5").unwrap_err();
+        let err = Amount::parse("@5".as_bytes()).unwrap_err();
         assert_eq!(err.message, "expected a commodity");
     }
 
     #[test]
     fn a_control_byte_ends_a_bare_commodity() {
         // The symbol ends at the control byte, which is then left over
-        let err = Amount::parse("5 VTI\u{1}").unwrap_err();
+        let err = Amount::parse("5 VTI\u{1}".as_bytes()).unwrap_err();
         assert_eq!(err.message, "unexpected characters after the amount");
         assert_eq!(err.span, Span::new(5, 6));
     }
@@ -807,7 +986,7 @@ mod tests {
     fn an_empty_quoted_commodity_is_an_error() {
         // Empty quotes would allow in an amount with no commodity, which the
         // grammar refuses when written bare, and the span covers the quotes
-        let err = Amount::parse("5 \"\"").unwrap_err();
+        let err = Amount::parse("5 \"\"".as_bytes()).unwrap_err();
         assert_eq!(err.message, "empty commodity");
         assert_eq!(err.span, Span::new(2, 4));
     }
@@ -832,20 +1011,20 @@ mod tests {
     #[test]
     fn a_round_trippable_symbol_constructs() {
         let usd = Commodity::new("USD", Placement::Prefix).unwrap();
-        assert_eq!(usd.symbol(), "USD");
+        assert_eq!(usd.symbol(), b"USD");
         assert_eq!(usd.placement(), Placement::Prefix);
     }
 
     #[test]
     fn a_missing_number_is_an_error() {
-        let err = Amount::parse("$").unwrap_err();
+        let err = Amount::parse("$".as_bytes()).unwrap_err();
         assert_eq!(err.message, "expected a number");
     }
 
     #[test]
     fn a_number_too_large_is_an_error() {
         // 29 nines exceed Decimal's 96-bit maximum magnitude
-        let err = Amount::parse("$99999999999999999999999999999").unwrap_err();
+        let err = Amount::parse("$99999999999999999999999999999".as_bytes()).unwrap_err();
         assert_eq!(err.message, "number is too large to represent");
     }
 
@@ -853,7 +1032,7 @@ mod tests {
     fn a_number_too_precise_is_an_error() {
         // 29 fractional digits is one past what a decimal holds, and rounding it
         // would silently drop precision, so scanning rejects it instead
-        let err = Amount::parse("0.12345678901234567890123456789 VTI").unwrap_err();
+        let err = Amount::parse("0.12345678901234567890123456789 VTI".as_bytes()).unwrap_err();
         assert_eq!(
             err.message,
             "number has more fractional digits than a decimal can represent"
@@ -864,7 +1043,7 @@ mod tests {
     fn a_control_byte_in_a_quoted_commodity_is_an_error() {
         // A tab inside the quotes has no escape and would break the single-line
         // journal, and the span points at the offending byte
-        let err = Amount::parse("5 \"A\tB\"").unwrap_err();
+        let err = Amount::parse("5 \"A\tB\"".as_bytes()).unwrap_err();
         assert_eq!(err.message, "control character in commodity");
         assert_eq!(err.span, Span::new(4, 5));
     }
@@ -872,7 +1051,7 @@ mod tests {
     #[test]
     fn trailing_characters_are_an_error() {
         // The span covers everything left over, the space included
-        let err = Amount::parse("$5 x").unwrap_err();
+        let err = Amount::parse("$5 x".as_bytes()).unwrap_err();
         assert_eq!(err.message, "unexpected characters after the amount");
         assert_eq!(err.span, Span::new(2, 4));
     }
@@ -881,14 +1060,14 @@ mod tests {
     fn leading_whitespace_is_a_clear_error() {
         // The input is exactly the amount, so a leading space is reported as
         // such rather than as a missing commodity, spanning the whitespace run
-        let err = Amount::parse("  $5").unwrap_err();
+        let err = Amount::parse("  $5".as_bytes()).unwrap_err();
         assert_eq!(err.message, "leading whitespace before the amount");
         assert_eq!(err.span, Span::new(0, 2));
     }
 
     #[test]
     fn trailing_whitespace_is_a_clear_error() {
-        let err = Amount::parse("$5 ").unwrap_err();
+        let err = Amount::parse("$5 ".as_bytes()).unwrap_err();
         assert_eq!(err.message, "trailing whitespace after the amount");
         assert_eq!(err.span, Span::new(2, 3));
     }
@@ -897,7 +1076,7 @@ mod tests {
     fn a_second_sign_is_a_clear_error() {
         // The leading sign already bound to the number, so the sign between the
         // commodity and the number is the second one, reported at that byte
-        let err = Amount::parse("-$-5").unwrap_err();
+        let err = Amount::parse("-$-5".as_bytes()).unwrap_err();
         assert_eq!(err.message, "amount has more than one sign");
         assert_eq!(err.span, Span::new(2, 3));
     }

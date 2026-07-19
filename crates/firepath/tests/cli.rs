@@ -145,22 +145,49 @@ fn a_usage_error_exits_two_and_is_distinct_from_an_unreadable_file() {
 }
 
 #[test]
-fn check_on_a_non_utf8_file_exits_four() {
-    // A lone 0xe9 is a valid Latin-1 e-acute but not valid UTF-8. Upstream
-    // ledger reads this file, so the parser reading bytes is the fix. Until
-    // then it is refused as a decode failure, not as an unreadable file
-    let journal = temp_journal(b"2020-01-02 * Caf\xe9\n    Expenses:Food    $50.00\n");
+fn a_non_utf8_journal_parses_like_any_other() {
+    // A lone 0xe9 is a Latin-1 e-acute and not valid UTF-8
+    let journal =
+        temp_journal(b"2020-01-02 * Caf\xe9\n    Expenses:Food    $50.00\n    Assets:Checking\n");
     let output = firepath()
         .arg("check")
         .arg(journal.path())
         .output()
         .expect("run firepath");
 
-    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(output.status.code(), Some(0), "stderr: {:?}", output.stderr);
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn a_non_utf8_commodity_symbol_parses() {
+    // The one place the parser stores text rather than a span. A Latin-1 symbol
+    // has to survive being scanned into a commodity
+    let journal = temp_journal(b"2020-01-02 * Coffee\n    Expenses:Food    3 caf\xe9\n");
+    let output = firepath()
+        .arg("check")
+        .arg(journal.path())
+        .output()
+        .expect("run firepath");
+
+    assert_eq!(output.status.code(), Some(0), "stderr: {:?}", output.stderr);
+}
+
+#[test]
+fn an_error_in_a_non_utf8_journal_still_reports_its_location() {
+    // The high byte sits on line 1, the bad date on line 2. The column count is
+    // bytes, so the two-byte payee does not shift the reported line
+    let journal = temp_journal(b"2020-01-02 * Caf\xe9\n2020-13-01 Grocery\n");
+    let output = firepath()
+        .arg("check")
+        .arg(journal.path())
+        .output()
+        .expect("run firepath");
+
+    assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("is not valid UTF-8"), "got {stderr:?}");
     assert!(
-        !stderr.contains("cannot read"),
-        "a decode failure is not a read failure"
+        stderr.contains(":2:1: 2020-13-01 is not a real calendar date"),
+        "got {stderr:?}"
     );
 }

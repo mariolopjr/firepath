@@ -21,7 +21,8 @@ sha2.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
-firepath-ledger = { path = "../ledger" }
+firepath-ledger = { path = "../ledger", version = "0.1.0" }
+tempfile.workspace = true
 
 [lints]
 workspace = true

@@ -1,5 +1,14 @@
 //! `firepath-ledger`: the parser for the ledger journal grammar
 //!
+//! Every entry point takes `&[u8]`, not `&str`. A Latin-1 journal parses the
+//! same as a UTF-8 one. Spans are byte offsets, so columns count bytes.
+//!
+//! The one place text is stored rather than spanned is a [`Commodity`] symbol,
+//! which holds bytes for the same reason. Its `write_to` is the byte-exact
+//! output path. `Display` is for diagnostics and renders lossily. Error
+//! messages are [`String`], so the few that quote source text render it lossily
+//! as well.
+//!
 //! The scaffold lands the types the rest of the parser is built on: source
 //! spans and file handles ([`Span`], [`FileId`]), parse errors that render as
 //! `file:line:col` through a [`LineIndex`] ([`ParseError`]), and the per-file

@@ -116,7 +116,7 @@ fn closes_region(line: &[u8]) -> bool {
 /// Errors do not stop the grouping. An indented line with no open block above
 /// it is reported as an error and skipped, so one stray line costs one error
 /// and the blocks around it still group
-pub fn blocks(file: FileId, source: &str) -> Parsed<Block> {
+pub fn blocks(file: FileId, source: &[u8]) -> Parsed<Block> {
     let mut parsed = Parsed::new(file);
     // The block still accepting indented children, if any
     let mut open: Option<Block> = None;
@@ -124,7 +124,7 @@ pub fn blocks(file: FileId, source: &str) -> Parsed<Block> {
     // the open block is flushed, so at most one of `open` and `region` is Some
     let mut region: Option<Block> = None;
 
-    let bytes = source.as_bytes();
+    let bytes = source;
     let mut pos = 0usize;
     while pos < bytes.len() {
         // The line runs to the next newline or the end of input. Trailing
@@ -249,7 +249,7 @@ account Expenses:Food
 2020-01-03 coffee
     Expenses:Coffee    $4.00
 ";
-        let parsed = blocks(FileId::new(0), src);
+        let parsed = blocks(FileId::new(0), src.as_bytes());
         let got: Vec<_> = parsed.items.iter().map(|b| shape(src, b)).collect();
         assert_eq!(
             got,
@@ -307,10 +307,10 @@ account Expenses:Food
             ("~ monthly", BlockKind::Periodic),
             ("= /regex/", BlockKind::Automated),
             ("account Assets", BlockKind::Directive),
-            ("include txns/*.ledger", BlockKind::Directive),
+            ("include transactions/*.ledger", BlockKind::Directive),
             ("P 2020-01-02 VTI $150.00", BlockKind::Directive),
         ] {
-            let parsed = blocks(FileId::new(0), src);
+            let parsed = blocks(FileId::new(0), src.as_bytes());
             let got: Vec<_> = parsed.items.iter().map(|b| shape(src, b)).collect();
             assert_eq!(got, vec![(kind, src, vec![])], "dispatch of {src:?}");
             assert!(!parsed.has_errors(), "no errors for {src:?}");
@@ -320,7 +320,7 @@ account Expenses:Food
     #[test]
     fn a_blank_line_closes_the_open_block() {
         let src = "2020-01-02 payee\n    Assets:Cash  $5\n\n    Expenses:Food  $5\n";
-        let parsed = blocks(FileId::new(0), src);
+        let parsed = blocks(FileId::new(0), src.as_bytes());
         let got: Vec<_> = parsed.items.iter().map(|b| shape(src, b)).collect();
         assert_eq!(
             got,
@@ -344,7 +344,7 @@ account Expenses:Food
         // second header closes the first block and the end of input closes
         // the second. The tab-indented child attaches like a spaced one
         let src = "2020-01-02 one\n    Assets:Cash  $5\n2020-01-03 two\n\tAssets:Cash  $6";
-        let parsed = blocks(FileId::new(0), src);
+        let parsed = blocks(FileId::new(0), src.as_bytes());
         let got: Vec<_> = parsed.items.iter().map(|b| shape(src, b)).collect();
         assert_eq!(
             got,
@@ -367,7 +367,7 @@ account Expenses:Food
     #[test]
     fn a_comment_takes_no_children() {
         let src = "; note\n    indented under a comment\n";
-        let parsed = blocks(FileId::new(0), src);
+        let parsed = blocks(FileId::new(0), src.as_bytes());
         let got: Vec<_> = parsed.items.iter().map(|b| shape(src, b)).collect();
         assert_eq!(got, vec![(BlockKind::Comment, "; note", vec![])]);
         assert_eq!(parsed.errors.len(), 1);
@@ -382,7 +382,7 @@ account Expenses:Food
         // The middle line holds only a space and a tab: it closes the block
         // instead of attaching to it, so the transaction has no children
         let src = "2020-01-02 payee\n \t \naccount Assets\n";
-        let parsed = blocks(FileId::new(0), src);
+        let parsed = blocks(FileId::new(0), src.as_bytes());
         let got: Vec<_> = parsed.items.iter().map(|b| shape(src, b)).collect();
         assert_eq!(
             got,
@@ -400,7 +400,7 @@ account Expenses:Food
         // line's carriage returns, the doubled \r included, and the empty
         // CRLF line closes the transaction
         let src = "; c\r\n2020-01-02 p\r\n    a  $5\r\n\r\naccount A\r\r\n";
-        let parsed = blocks(FileId::new(0), src);
+        let parsed = blocks(FileId::new(0), src.as_bytes());
         assert_eq!(
             parsed.items,
             vec![
@@ -439,7 +439,7 @@ end comment extra
 2020-01-02 real
     Expenses:Food    $5.00
 ";
-        let parsed = blocks(FileId::new(0), src);
+        let parsed = blocks(FileId::new(0), src.as_bytes());
         let got: Vec<_> = parsed.items.iter().map(|b| shape(src, b)).collect();
         assert_eq!(
             got,
@@ -470,7 +470,7 @@ end comment extra
         // `comment` region with trailing text closed by `end test`: the cross
         // pairings and prefixed opener upstream accepts
         let src = "test\nraw\nend comment\n!comment trailing\nraw\nend test\n";
-        let parsed = blocks(FileId::new(0), src);
+        let parsed = blocks(FileId::new(0), src.as_bytes());
         let got: Vec<_> = parsed.items.iter().map(|b| shape(src, b)).collect();
         assert_eq!(
             got,
@@ -489,7 +489,7 @@ end comment extra
     #[test]
     fn an_indented_closer_does_not_close_a_region() {
         let src = "comment\n    end comment\nend comment\n";
-        let parsed = blocks(FileId::new(0), src);
+        let parsed = blocks(FileId::new(0), src.as_bytes());
         let got: Vec<_> = parsed.items.iter().map(|b| shape(src, b)).collect();
         assert_eq!(
             got,
@@ -507,7 +507,7 @@ end comment extra
         // No closer before end of input: the region keeps everything and no
         // error is reported, matching upstream
         let src = "comment\n2020-01-01 swallowed\n    also swallowed\n";
-        let parsed = blocks(FileId::new(0), src);
+        let parsed = blocks(FileId::new(0), src.as_bytes());
         let got: Vec<_> = parsed.items.iter().map(|b| shape(src, b)).collect();
         assert_eq!(
             got,
@@ -525,7 +525,7 @@ end comment extra
         // `comments` is an ordinary directive, so the indented line is its
         // child and no region opens
         let src = "comments\n    child\n";
-        let parsed = blocks(FileId::new(0), src);
+        let parsed = blocks(FileId::new(0), src.as_bytes());
         let got: Vec<_> = parsed.items.iter().map(|b| shape(src, b)).collect();
         assert_eq!(
             got,
@@ -537,7 +537,7 @@ end comment extra
     #[test]
     fn an_empty_source_yields_no_blocks() {
         for src in ["", "\n", "\n\n \n"] {
-            let parsed = blocks(FileId::new(0), src);
+            let parsed = blocks(FileId::new(0), src.as_bytes());
             assert!(parsed.items.is_empty(), "no blocks for {src:?}");
             assert!(!parsed.has_errors(), "no errors for {src:?}");
         }
@@ -545,7 +545,7 @@ end comment extra
 
     #[test]
     fn an_indented_first_line_is_an_orphan() {
-        let parsed = blocks(FileId::new(0), "    Assets:Cash  $5\n");
+        let parsed = blocks(FileId::new(0), "    Assets:Cash  $5\n".as_bytes());
         assert!(parsed.items.is_empty());
         assert_eq!(parsed.errors.len(), 1);
         let err = parsed.errors.first().unwrap();

@@ -16,7 +16,6 @@ use crate::span::{Span, clamp_u32};
 use jiff::civil::Date as Civil;
 use std::fmt;
 use std::ops::Range;
-use std::str::FromStr;
 
 /// 1970-01-01, the anchor the epoch-day count is measured from
 const EPOCH: Civil = Civil::constant(1970, 1, 1);
@@ -86,10 +85,10 @@ impl Date {
     /// floor; a well-formed shape whose month or day is not a real calendar
     /// date, February 29 outside a leap year included, errors saying the date
     /// does not exist
-    pub fn parse(src: &str) -> Result<Self, ParseError> {
+    pub fn parse(src: &[u8]) -> Result<Self, ParseError> {
         // The whole input is the date, so an error rejects it as a unit
         let full = Span::new(0, clamp_u32(src.len()));
-        let bytes = src.as_bytes();
+        let bytes = src;
 
         // A date is exactly ten bytes with the same separator in positions four
         // and seven. Length is checked first so the byte reads land in bounds
@@ -114,15 +113,25 @@ impl Date {
         // refused here rather than by the calendar check below
         if year < MIN_YEAR {
             return Err(ParseError::new(
-                format!("{src} is before {MIN_YEAR}, the earliest supported year"),
+                format!(
+                    "{} is before {MIN_YEAR}, the earliest supported year",
+                    String::from_utf8_lossy(src)
+                ),
                 full,
             ));
         }
 
         // jiff owns the calendar: month in 1..=12 and day in range for the month
         // and year, so a bad leap day is caught here
-        let civil = Civil::new(year, month, day)
-            .map_err(|_| ParseError::new(format!("{src} is not a real calendar date"), full))?;
+        let civil = Civil::new(year, month, day).map_err(|_| {
+            ParseError::new(
+                format!(
+                    "{} is not a real calendar date",
+                    String::from_utf8_lossy(src)
+                ),
+                full,
+            )
+        })?;
 
         Ok(Self { civil, separator })
     }
@@ -170,13 +179,22 @@ impl fmt::Display for Date {
 
 /// Parse a fixed-width digit run at `range` into `T`, or `None` if the slice is
 /// out of bounds, holds a non-digit, or does not fit `T`
-fn digits<T: FromStr>(src: &str, range: Range<usize>) -> Option<T> {
-    let text = src.get(range)?;
-    if text.bytes().all(|b| b.is_ascii_digit()) {
-        text.parse().ok()
-    } else {
-        None
+///
+/// The digits are folded directly rather than routed through `FromStr`, which
+/// would need the bytes to be text first. A date field is at most four digits,
+/// so the fold cannot overflow the `i32` it accumulates in
+fn digits<T: TryFrom<i32>>(src: &[u8], range: Range<usize>) -> Option<T> {
+    let field = src.get(range)?;
+    if field.is_empty() {
+        return None;
     }
+    let mut value = 0i32;
+    for &b in field {
+        let digit = i32::from(b.checked_sub(b'0').filter(|d| *d < 10)?);
+        // At most four digits
+        value = value.checked_mul(10)?.checked_add(digit)?;
+    }
+    T::try_from(value).ok()
 }
 
 #[cfg(test)]
@@ -190,7 +208,7 @@ mod tests {
     // the value survives a format then re-parse. The inputs are canonical
     // zero-padded dates, so the format is byte-identical to the input
     fn check(input: &str, year: i16, month: i8, day: i8, epoch: i32, separator: Separator) {
-        let date = Date::parse(input).unwrap();
+        let date = Date::parse(input.as_bytes()).unwrap();
         assert_eq!(date.civil().year(), year, "year of {input:?}");
         assert_eq!(date.civil().month(), month, "month of {input:?}");
         assert_eq!(date.civil().day(), day, "day of {input:?}");
@@ -198,7 +216,7 @@ mod tests {
         assert_eq!(date.separator(), separator, "separator of {input:?}");
         assert_eq!(date.to_string(), input, "round-trip of {input:?}");
         assert_eq!(
-            Date::parse(&date.to_string()).unwrap(),
+            Date::parse(date.to_string().as_bytes()).unwrap(),
             date,
             "reparse of {input:?}"
         );
@@ -234,7 +252,7 @@ mod tests {
         // jiff represents these years, but ledger's boost calendar does not,
         // and the floor keeps the two tools refusing the same dates
         for input in ["1399-12-31", "0001-01-01", "0000-01-01"] {
-            let err = Date::parse(input).unwrap_err();
+            let err = Date::parse(input.as_bytes()).unwrap_err();
             assert_eq!(
                 err.message,
                 format!("{input} is before 1400, the earliest supported year"),
@@ -254,18 +272,18 @@ mod tests {
     #[test]
     fn a_leap_day_outside_a_leap_year_is_rejected() {
         // The shape is well-formed, so this is a calendar error, not a form one
-        let err = Date::parse("2021-02-29").unwrap_err();
+        let err = Date::parse("2021-02-29".as_bytes()).unwrap_err();
         assert_eq!(err.message, "2021-02-29 is not a real calendar date");
         assert_eq!(err.span, Span::new(0, 10));
         // The century rule: divisible by 100 but not 400 is not a leap year
-        let err = Date::parse("1900-02-29").unwrap_err();
+        let err = Date::parse("1900-02-29".as_bytes()).unwrap_err();
         assert_eq!(err.message, "1900-02-29 is not a real calendar date");
     }
 
     #[test]
     fn out_of_range_months_and_days_are_rejected() {
         for input in ["2020-13-01", "2020-00-05", "2020-01-32", "2020-01-00"] {
-            let err = Date::parse(input).unwrap_err();
+            let err = Date::parse(input.as_bytes()).unwrap_err();
             assert_eq!(
                 err.message,
                 format!("{input} is not a real calendar date"),
@@ -292,7 +310,7 @@ mod tests {
             "2020-01-0z",  // non-digit day field
             "hello world", // not a date at all
         ] {
-            let err = Date::parse(input).unwrap_err();
+            let err = Date::parse(input.as_bytes()).unwrap_err();
             assert_eq!(
                 err.message, "expected a date in YYYY-MM-DD, YYYY/MM/DD, or YYYY.MM.DD form",
                 "form error expected for {input:?}"
@@ -302,17 +320,26 @@ mod tests {
 
     #[test]
     fn the_digits_helper_refuses_out_of_bounds_and_overflow() {
-        // Its None paths cannot be reached through parse, whose length check
-        // keeps every range in bounds and every field inside its width, so the
-        // helper's own contract is pinned directly
-        assert_eq!(super::digits::<i8>("12", 0..3), None);
-        assert_eq!(super::digits::<i8>("999", 0..3), None);
+        assert_eq!(super::digits::<i8>(b"12", 0..3), None);
+        assert_eq!(super::digits::<i8>(b"999", 0..3), None);
+        // An empty range is in bounds but holds no digits. The fold would read
+        // it as zero, so no digits has to be refused rather than yielding a
+        // month of 0
+        assert_eq!(super::digits::<i8>(b"2020", 0..0), None);
+        // More digits than the accumulator holds. parse never asks for a field
+        // wider than four, so these are the guards on the fold itself: it must
+        // refuse rather than wrap to some other value. The two guards fail on
+        // different inputs, because a value that overflows the multiply never
+        // reaches the add
+        assert_eq!(super::digits::<i8>(b"9999999999", 0..10), None);
+        // 214748364 * 10 still fits, so this one overflows on the final digit
+        assert_eq!(super::digits::<i8>(b"2147483649", 0..10), None);
     }
 
     #[test]
     fn the_same_day_with_different_separators_is_not_equal() {
-        let dash = Date::parse("2020-01-02").unwrap();
-        let slash = Date::parse("2020/01/02").unwrap();
+        let dash = Date::parse("2020-01-02".as_bytes()).unwrap();
+        let slash = Date::parse("2020/01/02".as_bytes()).unwrap();
         assert_ne!(dash, slash);
         // The day they name is the same, which the epoch day and civil expose
         assert_eq!(dash.epoch_day(), slash.epoch_day());

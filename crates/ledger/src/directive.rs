@@ -31,8 +31,8 @@ impl Directive {
     /// An `include` with no argument errors naming the missing path. Every
     /// directive that has no scanner yet, which today is every keyword but
     /// `include`, is refused as a hard error naming the keyword
-    pub fn parse(line: &str, base: u32) -> Result<Self, ParseError> {
-        let bytes = line.as_bytes();
+    pub fn parse(line: &[u8], base: u32) -> Result<Self, ParseError> {
+        let bytes = line;
         // A directive keyword may carry a leading `!` or `@`: ledger accepts
         // the prefixed form, so skip it before reading the keyword, the same
         // way the block grouper recognizes a prefixed `comment` or `test`
@@ -43,7 +43,7 @@ impl Directive {
         let kw_end = memchr::memchr2(b' ', b'\t', bytes).unwrap_or(bytes.len());
         let keyword = line.get(kw_start..kw_end).unwrap_or_default();
 
-        if keyword == "include" {
+        if keyword == b"include" {
             // The argument is the rest of the line, trimmed. Internal spaces
             // stay, so a path may hold them, but a leading or trailing run is
             // not part of the name
@@ -65,7 +65,10 @@ impl Directive {
         // word. An empty keyword, a bare `!` or `@`, widens so the refusal
         // stays visible
         Err(ParseError::new(
-            format!("the {keyword:?} directive is not supported yet"),
+            format!(
+                "the {:?} directive is not supported yet",
+                String::from_utf8_lossy(keyword)
+            ),
             widen_empty(span_at(base, kw_start, kw_end), base, line.len()),
         ))
     }
@@ -87,7 +90,7 @@ mod tests {
 
     // The argument span of an include line parsed at base 0
     fn include_arg(line: &str) -> Span {
-        let Directive::Include { argument } = Directive::parse(line, 0).unwrap();
+        let Directive::Include { argument } = Directive::parse(line.as_bytes(), 0).unwrap();
         argument
     }
 
@@ -96,8 +99,11 @@ mod tests {
         // A plain path, surrounding whitespace trimmed, and a glob all come
         // through verbatim between the trimmed bounds
         for (line, argument) in [
-            ("include txns/2020.ledger", "txns/2020.ledger"),
-            ("include  txns/*.ledger", "txns/*.ledger"),
+            (
+                "include transactions/2020.ledger",
+                "transactions/2020.ledger",
+            ),
+            ("include  transactions/*.ledger", "transactions/*.ledger"),
             (
                 "include ../shared/prices.ledger   ",
                 "../shared/prices.ledger",
@@ -114,9 +120,16 @@ mod tests {
     #[test]
     fn an_include_argument_span_is_exact() {
         // `include` is seven bytes, the space is byte seven, so the argument
-        // starts at byte eight and runs to the end of the line
-        let span = include_arg("include txns/2020.ledger");
-        assert_eq!(span, Span::new(8, 24));
+        // starts at byte eight and runs to the end of the line. The end is taken
+        // from the line rather than written out, so editing the path cannot
+        // leave the expectation behind
+        let line = "include transactions/2020.ledger";
+        let span = include_arg(line);
+        assert_eq!(
+            span,
+            Span::new(8, u32::try_from(line.len()).unwrap()),
+            "argument span of {line:?}"
+        );
     }
 
     #[test]
@@ -124,7 +137,7 @@ mod tests {
         // A bare keyword and a keyword with only trailing whitespace both have
         // no path to capture, so both error over the whole line
         for line in ["include", "include   ", "include\t"] {
-            let err = Directive::parse(line, 0).unwrap_err();
+            let err = Directive::parse(line.as_bytes(), 0).unwrap_err();
             assert_eq!(
                 err.message, "include directive is missing a file path",
                 "message for {line:?}"
@@ -150,7 +163,7 @@ mod tests {
             // A keyword alone, no argument, is still refused by name
             ("bucket", "bucket", 6),
         ] {
-            let err = Directive::parse(line, 0).unwrap_err();
+            let err = Directive::parse(line.as_bytes(), 0).unwrap_err();
             assert_eq!(
                 err.message,
                 format!("the {keyword:?} directive is not supported yet"),
@@ -166,15 +179,15 @@ mod tests {
         // captures its argument like a bare one and a prefixed unsupported
         // directive is refused by the keyword with the prefix dropped
         for prefix in ["!", "@"] {
-            let line = format!("{prefix}include txns/2020.ledger");
+            let line = format!("{prefix}include transactions/2020.ledger");
             assert_eq!(
                 text(&line, include_arg(&line)),
-                "txns/2020.ledger",
+                "transactions/2020.ledger",
                 "argument of {line:?}"
             );
 
             let line = format!("{prefix}account Assets:Cash");
-            let err = Directive::parse(&line, 0).unwrap_err();
+            let err = Directive::parse(line.as_bytes(), 0).unwrap_err();
             assert_eq!(
                 err.message, "the \"account\" directive is not supported yet",
                 "message for {line:?}"
@@ -189,7 +202,7 @@ mod tests {
         // A lone `!` or `@` has an empty keyword, so its refusal span widens
         // back over the prefix byte instead of rendering as nothing
         for line in ["!", "@"] {
-            let err = Directive::parse(line, 0).unwrap_err();
+            let err = Directive::parse(line.as_bytes(), 0).unwrap_err();
             assert_eq!(err.span, Span::new(0, 1), "span for {line:?}");
         }
     }
@@ -197,14 +210,21 @@ mod tests {
     #[test]
     fn spans_are_file_absolute_through_the_base() {
         // The include argument and the refusal keyword both shift by the base
-        let Directive::Include { argument } =
-            Directive::parse("include txns/2020.ledger", 1000).unwrap();
-        assert_eq!(argument, Span::new(1008, 1024));
+        const BASE: u32 = 1000;
 
-        let err = Directive::parse("account Assets", 1000).unwrap_err();
-        assert_eq!(err.span, Span::new(1000, 1007));
+        // `include` is seven bytes and the space is byte seven, so the argument
+        // starts at byte eight and runs to the end of the line. The end is taken
+        // from the line rather than written out, so editing the path cannot
+        // leave the expectation behind
+        let line = "include transactions/2020.ledger";
+        let Directive::Include { argument } = Directive::parse(line.as_bytes(), BASE).unwrap();
+        let end = BASE.saturating_add(u32::try_from(line.len()).unwrap());
+        assert_eq!(argument, Span::new(BASE.saturating_add(8), end));
 
-        let err = Directive::parse("include", 1000).unwrap_err();
-        assert_eq!(err.span, Span::new(1000, 1007));
+        let err = Directive::parse("account Assets".as_bytes(), BASE).unwrap_err();
+        assert_eq!(err.span, Span::new(BASE, BASE.saturating_add(7)));
+
+        let err = Directive::parse("include".as_bytes(), BASE).unwrap_err();
+        assert_eq!(err.span, Span::new(BASE, BASE.saturating_add(7)));
     }
 }

@@ -325,6 +325,7 @@ dependencies = [
  "rand_pcg",
  "serde",
  "sha2",
+ "tempfile",
  "toml",
 ]
 
