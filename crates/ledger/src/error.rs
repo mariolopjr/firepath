@@ -1,5 +1,7 @@
 //! Parse errors and the line index that renders their location
 
+use std::fmt;
+
 use crate::span::Span;
 
 /// A one-based line and column into a source file
@@ -46,19 +48,19 @@ impl LineIndex {
     /// renders a usable location. A far past-the-end offset only degrades to a
     /// column counted from the last line start which is not a meaningful position
     pub fn line_col(&self, offset: u32) -> LineCol {
-        // line 1 is the text before the first newline, so start there and count a
-        // line for each newline strictly before the offset. a newline is the last
-        // column of its own line, so one exactly at the offset starts no new line.
-        // newlines ascend, so stop at the first one at or past the offset
-        let mut line = 1usize;
-        let mut line_start = 0u32;
-        for &newline in &self.newlines {
-            if newline >= offset {
-                break;
-            }
-            line = line.saturating_add(1);
-            line_start = newline.saturating_add(1);
-        }
+        // Line 1 is the text before the first newline, so the line number is one
+        // more than the count of newlines strictly before the offset. a newline is
+        // the last column of its own line, so one exactly at the offset starts no
+        // new line. newlines ascend, so that count is a binary search rather than a
+        // walk, which keeps rendering every error in a file off O(errors * lines)
+        let preceding = self.newlines.partition_point(|&newline| newline < offset);
+        let line = preceding.saturating_add(1);
+        // The line starts just past the last newline before the offset, and at
+        // byte 0 when there is none
+        let line_start = preceding
+            .checked_sub(1)
+            .and_then(|last| self.newlines.get(last))
+            .map_or(0, |&newline| newline.saturating_add(1));
         let column = (offset.saturating_sub(line_start) as usize).saturating_add(1);
         LineCol { line, column }
     }
@@ -84,7 +86,10 @@ impl ParseError {
 
     /// Render as `file:line:col: message`, resolving the span start through the
     /// line index of the file the error came from
-    pub fn render(&self, file: &str, index: &LineIndex) -> String {
+    ///
+    /// `file` is anything printable so a caller can pass a `Path::display`
+    /// straight through without first building a `String` of it
+    pub fn render(&self, file: impl fmt::Display, index: &LineIndex) -> String {
         let LineCol { line, column } = index.line_col(self.span.start());
         format!("{file}:{line}:{column}: {}", self.message)
     }
@@ -123,6 +128,35 @@ mod tests {
         let index = LineIndex::new("abc\ndef\n");
         // offset 8 is one past the final newline, on the empty trailing line
         assert_eq!(index.line_col(8), lc(3, 1));
+    }
+
+    #[test]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "the fixture is a short literal, so every conversion fits"
+    )]
+    fn the_binary_search_agrees_with_a_linear_walk() {
+        // Guards the partition_point lookup against the straightforward count it
+        // replaced, across every offset of a source with uneven line lengths and
+        // both an empty line and a trailing one
+        let source = "abc\n\nde\nfghi\n\nj\n";
+        let index = LineIndex::new(source);
+        for offset in 0..=u32::try_from(source.len()).unwrap() {
+            let mut line = 1usize;
+            let mut line_start = 0u32;
+            for (nl, byte) in source.bytes().enumerate() {
+                let nl = u32::try_from(nl).unwrap();
+                if byte == b'\n' && nl < offset {
+                    line += 1;
+                    line_start = nl + 1;
+                }
+            }
+            assert_eq!(
+                index.line_col(offset),
+                lc(line, (offset - line_start) as usize + 1),
+                "offset {offset}"
+            );
+        }
     }
 
     #[test]

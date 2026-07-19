@@ -17,6 +17,7 @@ rand_pcg = "0.10"
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
+tempfile = "3"
 toml = "0.8"
 
 [workspace.lints.rust]

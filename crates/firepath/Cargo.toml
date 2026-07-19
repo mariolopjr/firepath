@@ -8,6 +8,10 @@ authors.workspace = true
 
 [dependencies]
 clap.workspace = true
+firepath-ledger = { path = "../ledger", version = "0.1.0" }
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
