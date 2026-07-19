@@ -5,11 +5,6 @@
 //! range method, and pulling in the whole `rand` crate for one
 //! is unnecessary
 
-// Nothing in `main` draws from the generator yet, generation wires it in
-// alongside the household in the next step. Until then only the tests exercise
-// it, so allow the otherwise-dead items in the non-test build
-#![allow(dead_code)]
-
 // Bring the generator trait's methods into scope without a name to avoid a clash
 // with this module's newtype `Rng`
 use rand_core::{Rng as _, SeedableRng};

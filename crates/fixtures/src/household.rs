@@ -4,9 +4,9 @@
 //! activity posts to, and the weights that bias discretionary spending across
 //! expense categories
 
-// Nothing in `main` reads the household yet, generation consumes it once
-// transaction emission lands. Until then only the tests touch it, so allow the
-// otherwise-dead items in the non-test build
+// The banking emitter reads the earners, the account tree, and the spending
+// weights. The investment accounts and the earner names wait for when investment
+// are implemented, so allow the fields still untouched in the non-test build
 #![allow(dead_code)]
 
 use crate::rng::Rng;
@@ -220,9 +220,36 @@ impl Household {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::Household;
+    use super::{ALEX_SALARY, CategoryWeight, Household, dollars};
     use crate::manifest::DEFAULT_SEED;
     use crate::rng::Rng;
+
+    // Two categories with zero weight, so the picker's walk falls through to its
+    // last-category fallback. Static so the `&'static` spending field can hold it
+    static ZERO_WEIGHTS: [CategoryWeight; 2] = [
+        CategoryWeight {
+            account: "Expenses:First",
+            weight: 0,
+        },
+        CategoryWeight {
+            account: "Expenses:Last",
+            weight: 0,
+        },
+    ];
+
+    // No categories at all, so the picker falls through to its empty-set fallback
+    static NO_WEIGHTS: [CategoryWeight; 0] = [];
+
+    #[test]
+    fn dollars_scale_whole_dollars_to_exact_cents() {
+        // The salary tables read in dollars but store cents, so the helper scales
+        // by exactly 100. Called at runtime here since the const tables evaluate
+        // it at compile time. Tied to a real step so the helper and the table
+        // cannot drift apart
+        assert_eq!(dollars(85_000), 8_500_000);
+        assert_eq!(dollars(0), 0);
+        assert_eq!(dollars(85_000), ALEX_SALARY[0].annual);
+    }
 
     #[test]
     fn the_household_has_two_earners_with_ascending_salaries() {
@@ -277,5 +304,25 @@ mod tests {
             let account = household.pick_category(&mut rng);
             assert!(household.spending.iter().any(|cat| cat.account == account));
         }
+    }
+
+    #[test]
+    fn pick_category_falls_back_to_the_last_category_when_every_weight_is_zero() {
+        // A zero total leaves the draw range empty, so the walk never returns and
+        // the fallback lands on the last category
+        let mut household = Household::sample();
+        household.spending = &ZERO_WEIGHTS;
+        let mut rng = Rng::new(DEFAULT_SEED);
+        assert_eq!(household.pick_category(&mut rng), "Expenses:Last");
+    }
+
+    #[test]
+    fn pick_category_falls_back_to_uncategorized_for_an_empty_set() {
+        // With no categories the walk has nothing to return and no last category,
+        // so the fallback names it uncategorized
+        let mut household = Household::sample();
+        household.spending = &NO_WEIGHTS;
+        let mut rng = Rng::new(DEFAULT_SEED);
+        assert_eq!(household.pick_category(&mut rng), "Expenses:Uncategorized");
     }
 }
