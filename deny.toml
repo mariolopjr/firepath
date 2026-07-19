@@ -21,6 +21,8 @@ confidence-threshold = 0.8
 [bans]
 multiple-versions = "deny"
 wildcards = "deny"
+# The workspace crates depend on each other by path and do not have a version
+allow-wildcard-paths = true
 
 # Crates must come from crates.io, reject other registries and git sources
 [sources]
