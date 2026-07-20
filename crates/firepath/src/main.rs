@@ -1,7 +1,7 @@
 //! firepath CLI
 //!
-//! `check` is the only subcommand so far: it parses one journal file and reports
-//! its errors. `--help` and `--version` come from clap
+//! [`Command::Check`] parses one journal file and reports its errors. [`Command::Lsp`] serves the
+//! language server over stdio. `--help` and `--version` come from clap
 
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
@@ -34,13 +34,28 @@ enum Command {
         /// The journal file to parse
         file: PathBuf,
     },
+
+    /// Serve the language server over stdin and stdout
+    Lsp,
 }
+
+/// Exit code when the language server failed
+const SERVER_FAILED: u8 = 4;
 
 fn main() -> ExitCode {
     // `parse` handles `--help` and `--version` by printing and exiting, and
     // rejects a missing or unknown subcommand before returning here
     match Cli::parse().command {
         Command::Check { file } => check::run(&file),
+        Command::Lsp => match firepath_lsp::run_stdio() {
+            Ok(exit) => ExitCode::from(exit.code()),
+            // stderr, because stdout belongs to the protocol even now that the
+            // session is over
+            Err(err) => {
+                eprintln!("firepath: language server failed: {err}");
+                ExitCode::from(SERVER_FAILED)
+            }
+        },
     }
 }
 

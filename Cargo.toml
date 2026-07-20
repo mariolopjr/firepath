@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/firepath", "crates/fixtures", "crates/ledger"]
+members = ["crates/firepath", "crates/fixtures", "crates/ledger", "crates/lsp"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,11 +11,14 @@ authors = ["Mario Lopez"]
 [workspace.dependencies]
 clap = { version = "4.5", features = ["derive"] }
 jiff = { version = "0.2", default-features = false, features = ["std"] }
+lsp-server = "0.10"
+lsp-types = "0.97"
 memchr = "2.8"
 rand_core = "0.10"
 rand_pcg = "0.10"
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
 toml = "0.8"

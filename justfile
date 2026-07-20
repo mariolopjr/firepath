@@ -45,9 +45,9 @@ accept-ledger: gen-fixtures
 deny:
   cargo deny check
 
-# Write an lcov report to coverage/ for editor gutters
+# Write an JSON report to coverage/ for editor gutters
 coverage:
-  cargo llvm-cov --branch --workspace --lcov --output-path coverage/lcov.info
+  cargo llvm-cov --branch --workspace --json --output-path coverage/coverage.json
 
 # Browse the coverage report as HTML
 coverage-html:
