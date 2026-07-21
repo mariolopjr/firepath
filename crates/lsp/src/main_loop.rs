@@ -60,28 +60,41 @@ pub trait Handler {
     /// response rather than by unwinding
     fn request(&mut self, request: Request) -> Response;
 
-    /// React to a notification. Notifications carry no reply, so a failure here
-    /// is only ever reported out of band
-    fn notification(&mut self, notification: Notification);
+    /// React to a notification, returning any messages the reaction produces
+    ///
+    /// A notification has no reply of its own, but reacting to one can make the
+    /// server push notifications of its own, like the diagnostics a change
+    /// produces. The loop sends whatever is returned, in order, so a handler
+    /// pushes to the client by returning rather than by holding the connection
+    fn notification(&mut self, notification: Notification) -> Vec<Message>;
 }
 
 /// A handler that refuses every request
 ///
-/// The server declares no capabilities, so a conforming client never sends a
-/// request that lands here
+/// A conforming client never sends a request that lands here
 #[derive(Debug)]
 pub struct MethodNotFound;
 
 impl Handler for MethodNotFound {
     fn request(&mut self, request: Request) -> Response {
-        Response::new_err(
-            request.id,
-            ErrorCode::MethodNotFound as i32,
-            format!("{} is not supported", request.method),
-        )
+        method_not_found(request)
     }
 
-    fn notification(&mut self, _notification: Notification) {}
+    fn notification(&mut self, _notification: Notification) -> Vec<Message> {
+        Vec::new()
+    }
+}
+
+/// The error response for a request the server has no capability for
+///
+/// A conforming client only sends a request the server advertised, so this
+/// answers a client that ignored the capabilities
+pub(crate) fn method_not_found(request: Request) -> Response {
+    Response::new_err(
+        request.id,
+        ErrorCode::MethodNotFound as i32,
+        format!("{} is not supported", request.method),
+    )
 }
 
 /// Read messages until the session ends, dispatching each to `handler`
@@ -123,11 +136,18 @@ pub fn main_loop<H: Handler>(connection: &Connection, handler: &mut H) -> Result
             Message::Notification(notification) if notification.method == EXIT => {
                 return Ok(Exit::WithoutShutdown);
             }
-            // The panic is caught only to avoid crashing the loop. The default
-            // panic hook has already printed it to stderr
+            // A notification can make the handler push messages back, like the
+            // diagnostics a change produces, and the loop sends them. The panic
+            // is caught only to avoid crashing the loop: the default hook has
+            // already printed it, and a panic sends nothing since the handler
+            // may be mid-update
             Message::Notification(notification) => {
-                let _ =
-                    panic::catch_unwind(AssertUnwindSafe(|| handler.notification(notification)));
+                let messages =
+                    panic::catch_unwind(AssertUnwindSafe(|| handler.notification(notification)))
+                        .unwrap_or_default();
+                for message in messages {
+                    connection.sender.send(message)?;
+                }
             }
             // The server sends no requests yet
             Message::Response(_) => {}

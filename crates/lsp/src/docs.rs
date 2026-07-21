@@ -72,7 +72,11 @@ impl Document {
         self.version
     }
 
-    /// Every error parsing the buffer found, in source order
+    /// Every error parsing the buffer found
+    ///
+    /// In the order the parse returned them, which is not source order: the
+    /// errors from grouping the file into blocks all come before the errors
+    /// from scanning those blocks
     pub fn errors(&self) -> &[ParseError] {
         &self.errors
     }

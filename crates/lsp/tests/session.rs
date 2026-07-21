@@ -10,8 +10,9 @@
 use std::panic;
 use std::thread;
 
-use firepath_lsp::{Exit, Handler, MethodNotFound, serve};
+use firepath_lsp::{Diagnostics, Exit, Handler, MethodNotFound, serve};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
+use lsp_types::{DiagnosticSeverity, Position, PublishDiagnosticsParams, Range};
 use serde_json::{Value, json};
 
 const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -86,13 +87,28 @@ impl Session {
     }
 
     fn notify(&self, method: &str) {
+        self.notify_with(method, json!({}));
+    }
+
+    // Sends a notification with a chosen body, for the sync notifications whose
+    // params the diagnostics handler reads
+    fn notify_with(&self, method: &str, params: Value) {
         self.client
             .sender
             .send(Message::Notification(Notification {
                 method: method.to_owned(),
-                params: json!({}),
+                params,
             }))
             .unwrap();
+    }
+
+    // The next message the server sent, which after a sync notification is the
+    // publishDiagnostics it answered with
+    fn recv(&self) -> Message {
+        match self.client.receiver.recv_timeout(REPLY_TIMEOUT) {
+            Ok(message) => message,
+            Err(err) => panic!("expected a message, got {err:?}"),
+        }
     }
 
     // The protocol's own exit: shutdown is answered, then exit ends the loop
@@ -120,7 +136,12 @@ fn initialize_handshake_reports_the_server_and_its_capabilities() {
     assert_eq!(
         result,
         json!({
-            "capabilities": {},
+            "capabilities": {
+                "textDocumentSync": {
+                    "openClose": true,
+                    "change": 1,
+                },
+            },
             "serverInfo": {
                 "name": "firepath-lsp",
                 "version": env!("CARGO_PKG_VERSION"),
@@ -189,11 +210,12 @@ impl Handler for Panicky {
         }
     }
 
-    fn notification(&mut self, notification: Notification) {
+    fn notification(&mut self, notification: Notification) -> Vec<Message> {
         assert_ne!(
             notification.method, "panic/now",
             "the notification handler exploded"
         );
+        Vec::new()
     }
 }
 
@@ -438,4 +460,545 @@ fn only_a_shutdown_before_the_exit_earns_a_zero_exit_code() {
     assert_eq!(Exit::Clean.code(), 0);
     assert_eq!(Exit::Disconnected.code(), 0);
     assert_eq!(Exit::WithoutShutdown.code(), 1);
+}
+
+// The publishDiagnostics params the server pushed, failing if it pushed
+// anything else
+fn published(message: Message) -> PublishDiagnosticsParams {
+    match message {
+        Message::Notification(notification) => {
+            assert_eq!(notification.method, "textDocument/publishDiagnostics");
+            serde_json::from_value(notification.params).expect("publishDiagnostics params")
+        }
+        other => panic!("expected a publishDiagnostics notification, got {other:?}"),
+    }
+}
+
+// A didOpen body for a document, the shape a client sends when a buffer opens
+fn did_open(uri: &str, version: i32, text: &str) -> Value {
+    json!({
+        "textDocument": {
+            "uri": uri,
+            "languageId": "ledger",
+            "version": version,
+            "text": text,
+        }
+    })
+}
+
+// An indented posting with no transaction above it: the parser's separated indented error,
+// spanning the whole line
+const INDENTED: &str = "    Assets:Cash  $5\n";
+
+#[test]
+fn opening_a_document_with_a_parse_error_publishes_a_diagnostic_at_its_range() {
+    let (session, _) = Session::start(Diagnostics::new());
+
+    session.notify_with(
+        "textDocument/didOpen",
+        did_open("file:///corpus.ledger", 1, INDENTED),
+    );
+
+    let params = published(session.recv());
+    assert_eq!(params.uri.as_str(), "file:///corpus.ledger");
+    // The version the client stamped the buffer with, so a client can drop a
+    // set a newer edit already superseded
+    assert_eq!(params.version, Some(1));
+    assert_eq!(params.diagnostics.len(), 1);
+    let diagnostic = params.diagnostics.first().expect("one diagnostic");
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(0, 0), Position::new(0, 19))
+    );
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(diagnostic.source.as_deref(), Some("firepath"));
+    assert!(!diagnostic.message.is_empty(), "{diagnostic:?}");
+
+    session.shutdown();
+}
+
+#[test]
+fn opening_a_clean_document_publishes_an_empty_set() {
+    let (session, _) = Session::start(Diagnostics::new());
+
+    session.notify_with(
+        "textDocument/didOpen",
+        did_open("file:///clean.ledger", 1, "; a comment\n"),
+    );
+
+    // A clean parse still publishes, with an empty set, so any earlier errors
+    // for the uri are cleared rather than left behind
+    let params = published(session.recv());
+    assert!(params.diagnostics.is_empty(), "{params:?}");
+
+    session.shutdown();
+}
+
+#[test]
+fn a_change_republishes_diagnostics_for_the_new_text() {
+    let (session, _) = Session::start(Diagnostics::new());
+
+    session.notify_with(
+        "textDocument/didOpen",
+        did_open("file:///edit.ledger", 1, "; clean\n"),
+    );
+    assert!(published(session.recv()).diagnostics.is_empty());
+
+    // Full sync: the change carries the whole new text, now with the orphan
+    session.notify_with(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": "file:///edit.ledger", "version": 2 },
+            "contentChanges": [{ "text": INDENTED }],
+        }),
+    );
+
+    let params = published(session.recv());
+    assert_eq!(params.version, Some(2));
+    assert_eq!(params.diagnostics.len(), 1);
+
+    session.shutdown();
+}
+
+#[test]
+fn a_change_to_a_document_that_was_never_opened_publishes_nothing() {
+    let (session, _) = Session::start(Diagnostics::new());
+
+    // Under full sync there is no prior buffer to replace, so the change is
+    // dropped without a publish
+    session.notify_with(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": "file:///ghost.ledger", "version": 1 },
+            "contentChanges": [{ "text": "; text\n" }],
+        }),
+    );
+
+    // The next open's publish is the next message, which proves the change
+    // above produced none
+    session.notify_with(
+        "textDocument/didOpen",
+        did_open("file:///real.ledger", 1, "; clean\n"),
+    );
+    assert_eq!(
+        published(session.recv()).uri.as_str(),
+        "file:///real.ledger"
+    );
+
+    session.shutdown();
+}
+
+#[test]
+fn a_change_carrying_no_content_publishes_nothing() {
+    let (session, _) = Session::start(Diagnostics::new());
+
+    session.notify_with(
+        "textDocument/didOpen",
+        did_open("file:///edit.ledger", 1, "; clean\n"),
+    );
+    assert!(published(session.recv()).diagnostics.is_empty());
+
+    // An empty change list has no new text to apply, so it is dropped
+    session.notify_with(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": "file:///edit.ledger", "version": 2 },
+            "contentChanges": [],
+        }),
+    );
+
+    // The next change carries text, and its publish is the next message, which
+    // proves the empty one produced none
+    session.notify_with(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": "file:///edit.ledger", "version": 3 },
+            "contentChanges": [{ "text": INDENTED }],
+        }),
+    );
+    let params = published(session.recv());
+    assert_eq!(params.version, Some(3));
+    assert_eq!(params.diagnostics.len(), 1);
+
+    session.shutdown();
+}
+
+#[test]
+fn closing_a_document_clears_its_diagnostics() {
+    let (session, _) = Session::start(Diagnostics::new());
+
+    session.notify_with(
+        "textDocument/didOpen",
+        did_open("file:///close.ledger", 1, INDENTED),
+    );
+    assert_eq!(published(session.recv()).diagnostics.len(), 1);
+
+    // Closing reverts the uri to the file on disk, so its buffer diagnostics no
+    // longer hold and are cleared with an empty set
+    session.notify_with(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": "file:///close.ledger" } }),
+    );
+    let params = published(session.recv());
+    assert_eq!(params.uri.as_str(), "file:///close.ledger");
+    assert!(params.diagnostics.is_empty(), "{params:?}");
+
+    session.shutdown();
+}
+
+#[test]
+fn closing_a_document_that_was_never_opened_publishes_nothing() {
+    let (session, _) = Session::start(Diagnostics::new());
+
+    session.notify_with(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": "file:///ghost.ledger" } }),
+    );
+
+    // The next open's publish is the next message, which proves the close
+    // produced none
+    session.notify_with(
+        "textDocument/didOpen",
+        did_open("file:///real.ledger", 1, "; clean\n"),
+    );
+    assert_eq!(
+        published(session.recv()).uri.as_str(),
+        "file:///real.ledger"
+    );
+
+    session.shutdown();
+}
+
+#[test]
+fn a_malformed_sync_notification_is_ignored_rather_than_ending_the_session() {
+    let (session, _) = Session::start(Diagnostics::new());
+
+    // A didOpen missing its textDocument cannot be read into params, so it is
+    // dropped rather than answered and the session survives it
+    session.notify_with("textDocument/didOpen", json!({}));
+
+    session.notify_with(
+        "textDocument/didOpen",
+        did_open("file:///real.ledger", 1, "; clean\n"),
+    );
+    assert_eq!(
+        published(session.recv()).uri.as_str(),
+        "file:///real.ledger"
+    );
+
+    session.shutdown();
+}
+
+#[test]
+fn an_unrelated_notification_is_dropped_by_the_diagnostics_handler() {
+    let (session, _) = Session::start(Diagnostics::new());
+
+    // didSave is not a sync method the handler routes, so it is dropped and the
+    // session is still there
+    session.notify("textDocument/didSave");
+
+    session.shutdown();
+}
+
+#[test]
+fn a_request_to_the_diagnostics_handler_is_refused() {
+    let (session, _) = Session::start(Diagnostics::new());
+
+    // The handler advertises only sync, no request capability, so a request
+    // lands as unsupported rather than being answered
+    let response = session.request(2, "textDocument/hover");
+    let error = response.response_result.expect_err("an error reply");
+    assert_eq!(error.code, ErrorCode::MethodNotFound as i32);
+    assert!(error.message.contains("textDocument/hover"), "{error:?}");
+
+    session.shutdown();
+}
+
+// The diagnostics of a publish as (range, message) pairs sorted by where they
+// start, since the parse returns its errors in block order rather than source
+// order and a set compared by position does not depend on which
+fn by_position(params: &PublishDiagnosticsParams) -> Vec<(Range, &str)> {
+    let mut located: Vec<(Range, &str)> = params
+        .diagnostics
+        .iter()
+        .map(|diagnostic| (diagnostic.range, diagnostic.message.as_str()))
+        .collect();
+    located.sort_by_key(|(range, _)| (range.start.line, range.start.character));
+    located
+}
+
+#[test]
+fn every_parse_error_in_a_buffer_becomes_its_own_diagnostic() {
+    let (session, _) = Session::start(Diagnostics::new());
+
+    // A bad header date, a posting with no amount after its commodity, and a
+    // posting whose amount is not one. The parse scans each block on its own
+    // rather than stopping at the first failure, so all three have to reach the
+    // client
+    session.notify_with(
+        "textDocument/didOpen",
+        did_open(
+            "file:///three.ledger",
+            1,
+            "2020-13-01 Grocery\n    Expenses:Food    $\n    Assets:Cash  @@@\n",
+        ),
+    );
+
+    let params = published(session.recv());
+    // Each lands on the line that holds it, so a diagnostic is not pinned to
+    // the start of the file, and each carries its own message
+    assert_eq!(
+        by_position(&params),
+        vec![
+            (
+                Range::new(Position::new(0, 0), Position::new(0, 10)),
+                "2020-13-01 is not a real calendar date",
+            ),
+            (
+                Range::new(Position::new(1, 21), Position::new(1, 22)),
+                "expected a number",
+            ),
+            (
+                Range::new(Position::new(2, 17), Position::new(2, 20)),
+                "expected a commodity",
+            ),
+        ]
+    );
+
+    session.shutdown();
+}
+
+#[test]
+fn a_diagnostic_character_counts_utf16_units_not_bytes() {
+    let (session, _) = Session::start(Diagnostics::new());
+
+    // The é before the end of the span is two bytes and one UTF-16 unit, so the
+    // span ends at byte 20 and the range has to end at character 19. Handing
+    // the byte offset over unmapped would underline one column past the line
+    session.notify_with(
+        "textDocument/didOpen",
+        did_open("file:///accented.ledger", 1, "    Assets:Café  $5\n"),
+    );
+
+    let params = published(session.recv());
+    assert_eq!(
+        by_position(&params)
+            .first()
+            .map(|&(range, _)| range)
+            .expect("one diagnostic"),
+        Range::new(Position::new(0, 0), Position::new(0, 19))
+    );
+
+    session.shutdown();
+}
+
+#[test]
+fn a_change_carrying_several_edits_publishes_the_last() {
+    let (session, _) = Session::start(Diagnostics::new());
+
+    session.notify_with(
+        "textDocument/didOpen",
+        did_open("file:///batched.ledger", 1, "; clean\n"),
+    );
+    assert!(published(session.recv()).diagnostics.is_empty());
+
+    // Each change under full sync is a whole document, so a client that batches
+    // several into one notification has each superseding the one before it.
+    // Taking the first would publish the indented line error the second edit
+    // already removed
+    session.notify_with(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": "file:///batched.ledger", "version": 2 },
+            "contentChanges": [{ "text": INDENTED }, { "text": "; clean again\n" }],
+        }),
+    );
+
+    let params = published(session.recv());
+    assert_eq!(params.version, Some(2));
+    assert!(params.diagnostics.is_empty(), "{params:?}");
+
+    session.shutdown();
+}
+
+#[test]
+fn an_incremental_change_is_dropped_rather_than_stored_as_the_whole_buffer() {
+    let (session, _) = Session::start(Diagnostics::new());
+
+    session.notify_with(
+        "textDocument/didOpen",
+        did_open("file:///partial.ledger", 1, "; clean\n"),
+    );
+    assert!(published(session.recv()).diagnostics.is_empty());
+
+    // A change carrying a range is one edit inside the buffer, not the buffer.
+    // The server declared full sync, so this is a client that ignored the
+    // capabilities, and taking its text as the whole document would leave the
+    // store holding five characters the user never wrote alone on a line
+    session.notify_with(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": "file:///partial.ledger", "version": 2 },
+            "contentChanges": [{
+                "range": {
+                    "start": { "line": 0, "character": 2 },
+                    "end": { "line": 0, "character": 7 },
+                },
+                "text": "dirty",
+            }],
+        }),
+    );
+
+    // The next whole-document change's publish is the next message, which
+    // proves the incremental one produced none, and it lands on the version
+    // that carried it rather than on anything the fragment left behind
+    session.notify_with(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": "file:///partial.ledger", "version": 3 },
+            "contentChanges": [{ "text": INDENTED }],
+        }),
+    );
+    let params = published(session.recv());
+    assert_eq!(params.version, Some(3));
+    assert_eq!(params.diagnostics.len(), 1);
+
+    session.shutdown();
+}
+
+#[test]
+fn reopening_a_uri_publishes_from_the_text_the_second_open_carried() {
+    let (session, _) = Session::start(Diagnostics::new());
+
+    session.notify_with(
+        "textDocument/didOpen",
+        did_open("file:///reopened.ledger", 1, INDENTED),
+    );
+    assert_eq!(published(session.recv()).diagnostics.len(), 1);
+
+    // A second open is the client resynchronizing, so its text replaces what
+    // was there. Ignoring it would leave the client marking an error the buffer
+    // it just sent does not have
+    session.notify_with(
+        "textDocument/didOpen",
+        did_open("file:///reopened.ledger", 2, "; clean\n"),
+    );
+
+    let params = published(session.recv());
+    assert_eq!(params.version, Some(2));
+    assert!(params.diagnostics.is_empty(), "{params:?}");
+
+    session.shutdown();
+}
+
+#[test]
+fn each_open_buffer_keeps_its_own_diagnostics() {
+    let (session, _) = Session::start(Diagnostics::new());
+
+    session.notify_with(
+        "textDocument/didOpen",
+        did_open("file:///first.ledger", 1, INDENTED),
+    );
+    assert_eq!(published(session.recv()).diagnostics.len(), 1);
+
+    session.notify_with(
+        "textDocument/didOpen",
+        did_open("file:///second.ledger", 1, "; clean\n"),
+    );
+    let params = published(session.recv());
+    assert_eq!(params.uri.as_str(), "file:///second.ledger");
+    assert!(params.diagnostics.is_empty(), "{params:?}");
+
+    // Editing one buffer publishes for that uri alone
+    session.notify_with(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": "file:///second.ledger", "version": 2 },
+            "contentChanges": [{ "text": INDENTED }],
+        }),
+    );
+    let params = published(session.recv());
+    assert_eq!(params.uri.as_str(), "file:///second.ledger");
+    assert_eq!(params.diagnostics.len(), 1);
+
+    // The first is still open under its own uri: a change to a uri that is not
+    // open publishes nothing, so this publish is what proves the second open
+    // did not displace it
+    session.notify_with(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": "file:///first.ledger", "version": 2 },
+            "contentChanges": [{ "text": "; clean\n" }],
+        }),
+    );
+    let params = published(session.recv());
+    assert_eq!(params.uri.as_str(), "file:///first.ledger");
+    assert!(params.diagnostics.is_empty(), "{params:?}");
+
+    session.shutdown();
+}
+
+// Takes the client's receiving end away and then sends `message`, so the server
+// handles it with nowhere to send what it produces. Returns how the session
+// ended, the protocol's own shutdown no longer being reachable
+fn send_to_a_client_that_stopped_reading(session: Session, message: Message) -> String {
+    let Session { client, server } = session;
+    let Connection { sender, receiver } = client;
+    // Dropped before the send, so the server's sender is already disconnected
+    // by the time it answers rather than racing the drop
+    drop(receiver);
+    sender.send(message).unwrap();
+    server
+        .join()
+        .expect("the server thread did not panic")
+        .expect_err("the session failed rather than ending")
+}
+
+// A client that stops reading is an editor that died mid-session. Every path
+// that sends has to report that rather than block on a channel nobody drains
+
+#[test]
+fn a_push_to_a_client_that_stopped_reading_ends_the_session() {
+    let (session, _) = Session::start(Diagnostics::new());
+
+    let failure = send_to_a_client_that_stopped_reading(
+        session,
+        Message::Notification(Notification {
+            method: "textDocument/didOpen".to_owned(),
+            params: did_open("file:///gone.ledger", 1, INDENTED),
+        }),
+    );
+    assert!(failure.contains("disconnected"), "{failure}");
+}
+
+#[test]
+fn a_reply_to_a_client_that_stopped_reading_ends_the_session() {
+    let (session, _) = Session::start(Diagnostics::new());
+
+    let failure = send_to_a_client_that_stopped_reading(
+        session,
+        Message::Request(Request {
+            id: RequestId::from(2),
+            method: "textDocument/hover".to_owned(),
+            params: json!({}),
+        }),
+    );
+    assert!(failure.contains("disconnected"), "{failure}");
+}
+
+#[test]
+fn a_shutdown_reply_to_a_client_that_stopped_reading_ends_the_session() {
+    let (session, _) = Session::start(Diagnostics::new());
+
+    // The shutdown reply goes out before the exit is waited on, so its send is
+    // where a client that stopped reading is noticed
+    let failure = send_to_a_client_that_stopped_reading(
+        session,
+        Message::Request(Request {
+            id: RequestId::from(9999),
+            method: "shutdown".to_owned(),
+            params: json!({}),
+        }),
+    );
+    assert!(failure.contains("disconnected"), "{failure}");
 }

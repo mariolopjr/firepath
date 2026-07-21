@@ -12,22 +12,28 @@
 //! [`Documents`] holds what the editor has open and maps between the byte
 //! spans the parser reports and the UTF-16 positions the client speaks in.
 //!
-//! No feature is attached to the loop yet: [`MethodNotFound`] answers every
-//! request, so nothing routes a sync notification into the store until
-//! diagnostics land
+//! [`Diagnostics`] is the handler the loop runs: it owns the [`Documents`]
+//! store, routes each sync notification into it, and publishes the parse
+//! errors of the buffer that changed
 
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+mod diag;
 mod docs;
+mod log;
 mod main_loop;
 
+pub use diag::Diagnostics;
 pub use docs::{Document, Documents};
 pub use main_loop::{Exit, Handler, MethodNotFound, main_loop};
 
 use std::time::{Duration, Instant};
 
 use lsp_server::Connection;
-use lsp_types::{InitializeResult, ServerCapabilities, ServerInfo};
+use lsp_types::{
+    InitializeResult, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextDocumentSyncOptions,
+};
 
 /// Anything that ends a session other than the client asking it to
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -43,9 +49,19 @@ const INITIALIZED_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What the server tells the client it can do
 ///
-/// Empty so far. A capability is declared only once it works
+/// Sync is the only capability so far: the client sends the whole text on every
+/// change, which is what [`Documents`] stores and re-parses.
 fn capabilities() -> ServerCapabilities {
-    ServerCapabilities::default()
+    ServerCapabilities {
+        text_document_sync: Some(TextDocumentSyncCapability::Options(
+            TextDocumentSyncOptions {
+                open_close: Some(true),
+                change: Some(TextDocumentSyncKind::FULL),
+                ..TextDocumentSyncOptions::default()
+            },
+        )),
+        ..ServerCapabilities::default()
+    }
 }
 
 /// Serve over stdin and stdout until the client shuts the server down
@@ -61,7 +77,7 @@ fn capabilities() -> ServerCapabilities {
 pub fn run_stdio() -> Result<Exit, Error> {
     // Each pipe gets a thread that owns it
     let (connection, threads) = Connection::stdio();
-    let result = serve(&connection, &mut MethodNotFound);
+    let result = serve(&connection, &mut Diagnostics::new());
     // Dropping the connection closes the channels the IO threads are parked on,
     // so it has to happen before the join or a failed session hangs here
     drop(connection);
