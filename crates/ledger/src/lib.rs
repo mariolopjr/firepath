@@ -57,7 +57,7 @@ pub use error::{LineCol, LineIndex, ParseError};
 pub use lines::{Block, BlockKind, blocks};
 pub use parse::parse;
 pub use posting::{Posting, PostingKind};
-pub use span::{FileId, Span};
+pub use span::{FileId, Span, clamp_u32};
 pub use transaction::{Status, TransactionHeader};
 
 /// The result of parsing one source file: the items parsed plus every error

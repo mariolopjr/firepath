@@ -64,7 +64,7 @@ impl Span {
 }
 
 /// Saturate a byte offset into `u32`, matching the span offset width
-pub(crate) fn clamp_u32(v: usize) -> u32 {
+pub fn clamp_u32(v: usize) -> u32 {
     u32::try_from(v).unwrap_or(u32::MAX)
 }
 

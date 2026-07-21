@@ -9,10 +9,19 @@
 //! [`Connection::memory`]. [`run_stdio`] is the same thing wired to the pipes
 //! an editor starts the process with.
 //!
-//! No feature is attached yet: [`MethodNotFound`] answers every request
+//! [`Documents`] holds what the editor has open and maps between the byte
+//! spans the parser reports and the UTF-16 positions the client speaks in.
+//!
+//! No feature is attached to the loop yet: [`MethodNotFound`] answers every
+//! request, so nothing routes a sync notification into the store until
+//! diagnostics land
 
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
+mod docs;
 mod main_loop;
 
+pub use docs::{Document, Documents};
 pub use main_loop::{Exit, Handler, MethodNotFound, main_loop};
 
 use std::time::{Duration, Instant};
