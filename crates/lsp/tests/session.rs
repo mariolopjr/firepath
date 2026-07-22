@@ -5,14 +5,18 @@
 //! client: it does the handshake, sends requests, reads replies, and shuts the
 //! server down.
 
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+#![cfg_attr(coverage_nightly, coverage(off))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::panic;
 use std::thread;
 
-use firepath_lsp::{Diagnostics, Exit, Handler, MethodNotFound, serve};
+use firepath_lsp::{Exit, Handler, MethodNotFound, Server, serve};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
-use lsp_types::{DiagnosticSeverity, Position, PublishDiagnosticsParams, Range};
+use lsp_types::{
+    DiagnosticSeverity, Position, PublishDiagnosticsParams, Range, SemanticToken, SemanticTokens,
+};
 use serde_json::{Value, json};
 
 const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -72,12 +76,18 @@ impl Session {
     }
 
     fn request(&self, id: i32, method: &str) -> Response {
+        self.request_with(id, method, json!({}))
+    }
+
+    // Sends a request with a chosen body, for the requests whose params the
+    // server reads
+    fn request_with(&self, id: i32, method: &str, params: Value) -> Response {
         self.client
             .sender
             .send(Message::Request(Request {
                 id: RequestId::from(id),
                 method: method.to_owned(),
-                params: json!({}),
+                params,
             }))
             .unwrap();
         match self.client.receiver.recv_timeout(REPLY_TIMEOUT).unwrap() {
@@ -133,6 +143,8 @@ impl Session {
 fn initialize_handshake_reports_the_server_and_its_capabilities() {
     let (session, result) = Session::start(MethodNotFound);
 
+    // The legend is pinned here because a token names its type by index into
+    // it: reordering it silently recolors every token the server sends
     assert_eq!(
         result,
         json!({
@@ -140,6 +152,15 @@ fn initialize_handshake_reports_the_server_and_its_capabilities() {
                 "textDocumentSync": {
                     "openClose": true,
                     "change": 1,
+                },
+                "semanticTokensProvider": {
+                    "legend": {
+                        "tokenTypes": [
+                            "date", "payee", "account", "amount", "commodity", "comment",
+                        ],
+                        "tokenModifiers": [],
+                    },
+                    "full": true,
                 },
             },
             "serverInfo": {
@@ -492,7 +513,7 @@ const INDENTED: &str = "    Assets:Cash  $5\n";
 
 #[test]
 fn opening_a_document_with_a_parse_error_publishes_a_diagnostic_at_its_range() {
-    let (session, _) = Session::start(Diagnostics::new());
+    let (session, _) = Session::start(Server::new());
 
     session.notify_with(
         "textDocument/didOpen",
@@ -519,7 +540,7 @@ fn opening_a_document_with_a_parse_error_publishes_a_diagnostic_at_its_range() {
 
 #[test]
 fn opening_a_clean_document_publishes_an_empty_set() {
-    let (session, _) = Session::start(Diagnostics::new());
+    let (session, _) = Session::start(Server::new());
 
     session.notify_with(
         "textDocument/didOpen",
@@ -536,7 +557,7 @@ fn opening_a_clean_document_publishes_an_empty_set() {
 
 #[test]
 fn a_change_republishes_diagnostics_for_the_new_text() {
-    let (session, _) = Session::start(Diagnostics::new());
+    let (session, _) = Session::start(Server::new());
 
     session.notify_with(
         "textDocument/didOpen",
@@ -562,7 +583,7 @@ fn a_change_republishes_diagnostics_for_the_new_text() {
 
 #[test]
 fn a_change_to_a_document_that_was_never_opened_publishes_nothing() {
-    let (session, _) = Session::start(Diagnostics::new());
+    let (session, _) = Session::start(Server::new());
 
     // Under full sync there is no prior buffer to replace, so the change is
     // dropped without a publish
@@ -590,7 +611,7 @@ fn a_change_to_a_document_that_was_never_opened_publishes_nothing() {
 
 #[test]
 fn a_change_carrying_no_content_publishes_nothing() {
-    let (session, _) = Session::start(Diagnostics::new());
+    let (session, _) = Session::start(Server::new());
 
     session.notify_with(
         "textDocument/didOpen",
@@ -625,7 +646,7 @@ fn a_change_carrying_no_content_publishes_nothing() {
 
 #[test]
 fn closing_a_document_clears_its_diagnostics() {
-    let (session, _) = Session::start(Diagnostics::new());
+    let (session, _) = Session::start(Server::new());
 
     session.notify_with(
         "textDocument/didOpen",
@@ -648,7 +669,7 @@ fn closing_a_document_clears_its_diagnostics() {
 
 #[test]
 fn closing_a_document_that_was_never_opened_publishes_nothing() {
-    let (session, _) = Session::start(Diagnostics::new());
+    let (session, _) = Session::start(Server::new());
 
     session.notify_with(
         "textDocument/didClose",
@@ -671,7 +692,7 @@ fn closing_a_document_that_was_never_opened_publishes_nothing() {
 
 #[test]
 fn a_malformed_sync_notification_is_ignored_rather_than_ending_the_session() {
-    let (session, _) = Session::start(Diagnostics::new());
+    let (session, _) = Session::start(Server::new());
 
     // A didOpen missing its textDocument cannot be read into params, so it is
     // dropped rather than answered and the session survives it
@@ -690,8 +711,8 @@ fn a_malformed_sync_notification_is_ignored_rather_than_ending_the_session() {
 }
 
 #[test]
-fn an_unrelated_notification_is_dropped_by_the_diagnostics_handler() {
-    let (session, _) = Session::start(Diagnostics::new());
+fn an_unrelated_notification_is_dropped_by_the_server() {
+    let (session, _) = Session::start(Server::new());
 
     // didSave is not a sync method the handler routes, so it is dropped and the
     // session is still there
@@ -701,16 +722,152 @@ fn an_unrelated_notification_is_dropped_by_the_diagnostics_handler() {
 }
 
 #[test]
-fn a_request_to_the_diagnostics_handler_is_refused() {
-    let (session, _) = Session::start(Diagnostics::new());
+fn a_request_the_server_has_no_capability_for_is_refused() {
+    let (session, _) = Session::start(Server::new());
 
-    // The handler advertises only sync, no request capability, so a request
-    // lands as unsupported rather than being answered
+    // Hover is not advertised, so a request for it lands as unsupported rather
+    // than being answered
     let response = session.request(2, "textDocument/hover");
     let error = response.response_result.expect_err("an error reply");
     assert_eq!(error.code, ErrorCode::MethodNotFound as i32);
     assert!(error.message.contains("textDocument/hover"), "{error:?}");
 
+    session.shutdown();
+}
+
+// The tokens of a semanticTokens/full reply, failing if the server answered
+// with anything else
+fn semantic_tokens(response: Response) -> Vec<SemanticToken> {
+    let result = response.response_result.expect("a semantic tokens reply");
+    serde_json::from_value::<SemanticTokens>(result)
+        .expect("semantic tokens")
+        .data
+}
+
+// A semanticTokens/full body for a uri, the shape a client sends to color a
+// buffer it has open
+fn semantic_tokens_request(uri: &str) -> Value {
+    json!({ "textDocument": { "uri": uri } })
+}
+
+#[test]
+fn semantic_tokens_encode_the_constructs_of_the_open_buffer() {
+    let (session, _) = Session::start(Server::new());
+
+    session.notify_with(
+        "textDocument/didOpen",
+        did_open(
+            "file:///tokens.ledger",
+            1,
+            "2020-01-02 * Grocery\n    Expenses:Food  $50.00\n",
+        ),
+    );
+    published(session.recv());
+
+    // Each token is a delta from the one before it: the line it moved down, the
+    // character it starts at, its length, and its type as an index into the
+    // legend the handshake published
+    let tokens = semantic_tokens(session.request_with(
+        2,
+        "textDocument/semanticTokens/full",
+        semantic_tokens_request("file:///tokens.ledger"),
+    ));
+    assert_eq!(
+        tokens,
+        vec![
+            // `2020-01-02` and `Grocery` on the header line
+            token(0, 0, 10, 0),
+            token(0, 13, 7, 1),
+            // `Expenses:Food`, then the `$` and the `50.00` it prefixes
+            token(1, 4, 13, 2),
+            token(0, 15, 1, 4),
+            token(0, 1, 5, 3),
+        ]
+    );
+
+    session.shutdown();
+}
+
+// One encoded token, in the order the protocol writes its fields
+fn token(delta_line: u32, delta_start: u32, length: u32, token_type: u32) -> SemanticToken {
+    SemanticToken {
+        delta_line,
+        delta_start,
+        length,
+        token_type,
+        token_modifiers_bitset: 0,
+    }
+}
+
+#[test]
+fn semantic_tokens_follow_the_buffer_as_it_changes() {
+    let (session, _) = Session::start(Server::new());
+
+    session.notify_with(
+        "textDocument/didOpen",
+        did_open("file:///live.ledger", 1, "; a comment\n"),
+    );
+    published(session.recv());
+    assert_eq!(
+        semantic_tokens(session.request_with(
+            2,
+            "textDocument/semanticTokens/full",
+            semantic_tokens_request("file:///live.ledger"),
+        )),
+        vec![token(0, 0, 11, 5)]
+    );
+
+    // The tokens come from the buffer, not the file, so an edit that has not
+    // been saved still has to change them
+    session.notify_with(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": "file:///live.ledger", "version": 2 },
+            "contentChanges": [{ "text": "2020-01-02 Grocery\n" }],
+        }),
+    );
+    published(session.recv());
+    assert_eq!(
+        semantic_tokens(session.request_with(
+            3,
+            "textDocument/semanticTokens/full",
+            semantic_tokens_request("file:///live.ledger"),
+        )),
+        vec![token(0, 0, 10, 0), token(0, 11, 7, 1)]
+    );
+
+    session.shutdown();
+}
+
+#[test]
+fn semantic_tokens_for_a_buffer_that_is_not_open_are_null() {
+    let (session, _) = Session::start(Server::new());
+
+    // Nothing is open, so there is no buffer to color. What is on disk is not
+    // what the client is showing, so the protocol's null is the answer rather
+    // than tokens taken from somewhere else
+    let response = session.request_with(
+        2,
+        "textDocument/semanticTokens/full",
+        semantic_tokens_request("file:///closed.ledger"),
+    );
+    assert_eq!(response.response_result.ok(), Some(json!(null)));
+
+    session.shutdown();
+}
+
+#[test]
+fn a_semantic_tokens_request_that_cannot_be_read_is_answered_with_an_error() {
+    let (session, _) = Session::start(Server::new());
+
+    // A request always carries a reply, so params that do not read are refused
+    // rather than dropped the way a notification is: a client left waiting on a
+    // reply that never comes is worse than one told what it got wrong
+    let response = session.request(2, "textDocument/semanticTokens/full");
+    let error = response.response_result.expect_err("an error reply");
+    assert_eq!(error.code, ErrorCode::InvalidParams as i32);
+
+    // The session survives it
     session.shutdown();
 }
 
@@ -729,7 +886,7 @@ fn by_position(params: &PublishDiagnosticsParams) -> Vec<(Range, &str)> {
 
 #[test]
 fn every_parse_error_in_a_buffer_becomes_its_own_diagnostic() {
-    let (session, _) = Session::start(Diagnostics::new());
+    let (session, _) = Session::start(Server::new());
 
     // A bad header date, a posting with no amount after its commodity, and a
     // posting whose amount is not one. The parse scans each block on its own
@@ -770,7 +927,7 @@ fn every_parse_error_in_a_buffer_becomes_its_own_diagnostic() {
 
 #[test]
 fn a_diagnostic_character_counts_utf16_units_not_bytes() {
-    let (session, _) = Session::start(Diagnostics::new());
+    let (session, _) = Session::start(Server::new());
 
     // The é before the end of the span is two bytes and one UTF-16 unit, so the
     // span ends at byte 20 and the range has to end at character 19. Handing
@@ -794,7 +951,7 @@ fn a_diagnostic_character_counts_utf16_units_not_bytes() {
 
 #[test]
 fn a_change_carrying_several_edits_publishes_the_last() {
-    let (session, _) = Session::start(Diagnostics::new());
+    let (session, _) = Session::start(Server::new());
 
     session.notify_with(
         "textDocument/didOpen",
@@ -823,7 +980,7 @@ fn a_change_carrying_several_edits_publishes_the_last() {
 
 #[test]
 fn an_incremental_change_is_dropped_rather_than_stored_as_the_whole_buffer() {
-    let (session, _) = Session::start(Diagnostics::new());
+    let (session, _) = Session::start(Server::new());
 
     session.notify_with(
         "textDocument/didOpen",
@@ -868,7 +1025,7 @@ fn an_incremental_change_is_dropped_rather_than_stored_as_the_whole_buffer() {
 
 #[test]
 fn reopening_a_uri_publishes_from_the_text_the_second_open_carried() {
-    let (session, _) = Session::start(Diagnostics::new());
+    let (session, _) = Session::start(Server::new());
 
     session.notify_with(
         "textDocument/didOpen",
@@ -893,7 +1050,7 @@ fn reopening_a_uri_publishes_from_the_text_the_second_open_carried() {
 
 #[test]
 fn each_open_buffer_keeps_its_own_diagnostics() {
-    let (session, _) = Session::start(Diagnostics::new());
+    let (session, _) = Session::start(Server::new());
 
     session.notify_with(
         "textDocument/didOpen",
@@ -959,7 +1116,7 @@ fn send_to_a_client_that_stopped_reading(session: Session, message: Message) -> 
 
 #[test]
 fn a_push_to_a_client_that_stopped_reading_ends_the_session() {
-    let (session, _) = Session::start(Diagnostics::new());
+    let (session, _) = Session::start(Server::new());
 
     let failure = send_to_a_client_that_stopped_reading(
         session,
@@ -973,7 +1130,7 @@ fn a_push_to_a_client_that_stopped_reading_ends_the_session() {
 
 #[test]
 fn a_reply_to_a_client_that_stopped_reading_ends_the_session() {
-    let (session, _) = Session::start(Diagnostics::new());
+    let (session, _) = Session::start(Server::new());
 
     let failure = send_to_a_client_that_stopped_reading(
         session,
@@ -988,7 +1145,7 @@ fn a_reply_to_a_client_that_stopped_reading_ends_the_session() {
 
 #[test]
 fn a_shutdown_reply_to_a_client_that_stopped_reading_ends_the_session() {
-    let (session, _) = Session::start(Diagnostics::new());
+    let (session, _) = Session::start(Server::new());
 
     // The shutdown reply goes out before the exit is waited on, so its send is
     // where a client that stopped reading is noticed

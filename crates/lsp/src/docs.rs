@@ -28,7 +28,7 @@ use lsp_types::{Position, Range, Uri};
 /// The handle every parse is tagged with
 ///
 /// An error carries a span, not a file, so nothing reads this back today
-const SOLE_FILE: FileId = FileId::new(0);
+pub(crate) const SOLE_FILE: FileId = FileId::new(0);
 
 /// One open buffer: its text, the version the client last gave it, and what
 /// parsing that text found
@@ -46,7 +46,7 @@ pub struct Document {
 
 impl Document {
     /// Parse a buffer into a document
-    fn new(version: i32, text: String) -> Self {
+    pub(crate) fn new(version: i32, text: String) -> Self {
         Self::from_bytes(version, text.into_bytes())
     }
 

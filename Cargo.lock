@@ -358,6 +358,7 @@ dependencies = [
 name = "firepath-lsp"
 version = "0.1.0"
 dependencies = [
+ "firepath-fixtures",
  "firepath-ledger",
  "lsp-server",
  "lsp-types",

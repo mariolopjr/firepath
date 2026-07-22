@@ -77,7 +77,7 @@ pub struct MethodNotFound;
 
 impl Handler for MethodNotFound {
     fn request(&mut self, request: Request) -> Response {
-        method_not_found(request)
+        method_not_found(request.id, &request.method)
     }
 
     fn notification(&mut self, _notification: Notification) -> Vec<Message> {
@@ -89,11 +89,11 @@ impl Handler for MethodNotFound {
 ///
 /// A conforming client only sends a request the server advertised, so this
 /// answers a client that ignored the capabilities
-pub(crate) fn method_not_found(request: Request) -> Response {
+pub(crate) fn method_not_found(id: RequestId, method: &str) -> Response {
     Response::new_err(
-        request.id,
+        id,
         ErrorCode::MethodNotFound as i32,
-        format!("{} is not supported", request.method),
+        format!("{method} is not supported"),
     )
 }
 

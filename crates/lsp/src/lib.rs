@@ -12,9 +12,10 @@
 //! [`Documents`] holds what the editor has open and maps between the byte
 //! spans the parser reports and the UTF-16 positions the client speaks in.
 //!
-//! [`Diagnostics`] is the handler the loop runs: it owns the [`Documents`]
-//! store, routes each sync notification into it, and publishes the parse
-//! errors of the buffer that changed
+//! [`Server`] is the handler the loop runs: it owns the [`Documents`] store,
+//! routes each sync notification into it, publishes the parse errors of the
+//! buffer that changed, and answers the semantic tokens of the buffer a request
+//! names
 
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
@@ -22,16 +23,20 @@ mod diag;
 mod docs;
 mod log;
 mod main_loop;
+mod server;
+mod tokens;
 
-pub use diag::Diagnostics;
 pub use docs::{Document, Documents};
 pub use main_loop::{Exit, Handler, MethodNotFound, main_loop};
+pub use server::Server;
 
+use std::io;
 use std::time::{Duration, Instant};
 
 use lsp_server::Connection;
 use lsp_types::{
-    InitializeResult, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
+    InitializeResult, SemanticTokensFullOptions, SemanticTokensOptions,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
     TextDocumentSyncKind, TextDocumentSyncOptions,
 };
 
@@ -49,8 +54,12 @@ const INITIALIZED_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What the server tells the client it can do
 ///
-/// Sync is the only capability so far: the client sends the whole text on every
-/// change, which is what [`Documents`] stores and re-parses.
+/// Sync is full: the client sends the whole text on every change, which is what
+/// [`Documents`] stores and re-parses.
+///
+/// Semantic tokens are whole-document only. A delta needs the previous result
+/// kept per buffer, and a range needs the block a range starts inside, neither
+/// of which the store holds
 fn capabilities() -> ServerCapabilities {
     ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Options(
@@ -58,6 +67,13 @@ fn capabilities() -> ServerCapabilities {
                 open_close: Some(true),
                 change: Some(TextDocumentSyncKind::FULL),
                 ..TextDocumentSyncOptions::default()
+            },
+        )),
+        semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+            SemanticTokensOptions {
+                legend: tokens::legend(),
+                full: Some(SemanticTokensFullOptions::Bool(true)),
+                ..SemanticTokensOptions::default()
             },
         )),
         ..ServerCapabilities::default()
@@ -77,15 +93,20 @@ fn capabilities() -> ServerCapabilities {
 pub fn run_stdio() -> Result<Exit, Error> {
     // Each pipe gets a thread that owns it
     let (connection, threads) = Connection::stdio();
-    let result = serve(&connection, &mut Diagnostics::new());
+    let result = serve(&connection, &mut Server::new());
     // Dropping the connection closes the channels the IO threads are parked on,
     // so it has to happen before the join or a failed session hangs here
     drop(connection);
-    let joined = threads.join();
-    // A session that failed usually takes the IO threads down with it, and of
-    // the two errors the session's is the one that says what went wrong. The
-    // join is only allowed to report when the session itself had nothing to say
-    match (result, joined) {
+    outcome(result, threads.join())
+}
+
+/// How a session and the join of its IO threads combine into one result
+///
+/// A session that failed usually takes the IO threads down with it, and of the
+/// two errors the session's is the one that says what went wrong. The join is
+/// only allowed to report when the session itself had nothing to say
+fn outcome(session: Result<Exit, Error>, joined: io::Result<()>) -> Result<Exit, Error> {
+    match (session, joined) {
         (Err(session), _) => Err(session),
         (Ok(_), Err(join)) => Err(join.into()),
         (Ok(exit), Ok(())) => Ok(exit),
@@ -120,4 +141,45 @@ pub fn serve<H: Handler>(connection: &Connection, handler: &mut H) -> Result<Exi
         started.elapsed() < INITIALIZED_TIMEOUT
     })?;
     main_loop(connection, handler)
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[allow(clippy::unwrap_used, reason = "unwrap keeps the fixtures terse")]
+mod tests {
+    use std::io;
+
+    use super::{Exit, outcome};
+
+    #[test]
+    fn a_failed_session_reports_its_own_error_over_the_join() {
+        // Both ends fail together when the pipe breaks, and the join only says
+        // that a thread returned an error, so the session's message is the one
+        // that names what happened
+        let failure = outcome(
+            Err("the client stopped reading".into()),
+            Err(io::Error::other("broken pipe")),
+        )
+        .unwrap_err();
+        assert_eq!(failure.to_string(), "the client stopped reading");
+    }
+
+    #[test]
+    fn a_clean_session_reports_a_join_that_failed() {
+        // Nothing else would say the IO threads came down badly, so a session
+        // that ended cleanly hands the process the join's error rather than a
+        // zero exit code
+        let failure = outcome(Ok(Exit::Clean), Err(io::Error::other("broken pipe")))
+            .unwrap_err()
+            .to_string();
+        assert!(failure.contains("broken pipe"), "{failure}");
+    }
+
+    #[test]
+    fn a_clean_session_with_a_clean_join_reports_how_it_ended() {
+        assert_eq!(
+            outcome(Ok(Exit::WithoutShutdown), Ok(())).unwrap(),
+            Exit::WithoutShutdown
+        );
+    }
 }
