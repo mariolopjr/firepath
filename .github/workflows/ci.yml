@@ -72,8 +72,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@just
       - run: just fetch-upstream
+      # --include-ignored, or the upstream harness runner counts as dead code
       - name: Measure coverage
-        run: cargo llvm-cov --branch --workspace --lcov --output-path coverage/lcov.info
+        run: cargo llvm-cov --branch --workspace --lcov --output-path coverage/lcov.info -- --include-ignored
       # Codecov stores the coverage % and shields.io renders it from there
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7

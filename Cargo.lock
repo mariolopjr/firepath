@@ -340,6 +340,7 @@ dependencies = [
  "rand_core 0.10.1",
  "rand_pcg",
  "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "toml",

@@ -12,16 +12,25 @@ authors.workspace = true
 name = "gen-fixtures"
 path = "src/main.rs"
 
+# The upstream harness, kept a separate command from gen-fixtures: it reads the
+# submodule rather than the manifest
+[[bin]]
+name = "conformance-upstream"
+path = "src/bin/conformance-upstream.rs"
+
 [dependencies]
 clap.workspace = true
+# The upstream harness measures this parser against ledger's own tests, so the
+# parser is a dependency of the harness and not only of its tests
+firepath-ledger = { path = "../ledger", version = "0.1.0" }
 rand_core.workspace = true
 rand_pcg.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
-firepath-ledger = { path = "../ledger", version = "0.1.0" }
 tempfile.workspace = true
 
 [lints]
