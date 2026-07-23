@@ -41,6 +41,10 @@ accept-ledger: gen-fixtures
   ledger -f data/fixtures/main.ledger balance >/dev/null
   echo "ledger accepts the generated fixtures"
 
+# Checks out upstream ledger's tests, shallowly cloning as we only need the tests
+fetch-upstream:
+  git submodule update --init --depth 1 upstream/ledger
+
 # Audit dependencies for advisories, licenses, duplicates, and sources
 deny:
   cargo deny check

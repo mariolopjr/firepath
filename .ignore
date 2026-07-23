@@ -1,0 +1,5 @@
+# Search tools skip ledger's source tree: it is here as a submodule for its
+# tests, not to be read alongside firepath's own code. `rg -u` reaches it when
+# searching the upstream tests is the point
+# Git does not read this file, only ripgrep, fd, and friends
+upstream/

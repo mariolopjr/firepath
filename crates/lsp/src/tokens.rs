@@ -385,8 +385,8 @@ mod tests {
 
     #[test]
     fn the_excerpt_is_what_the_generator_still_emits() {
-        // The snapshot is only worth having while it is the real corpus, so the
-        // excerpt is checked against the generator rather than trusted
+        // The snapshot is only worth having while it is what the generator still
+        // writes, so the excerpt is checked against it rather than trusted
         let files = generate(&Manifest::default()).expect("the fixtures generate");
         let body = files
             .get("transactions/2015.ledger")

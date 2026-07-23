@@ -1,0 +1,4 @@
+[submodule "upstream/ledger"]
+	path = upstream/ledger
+	url = https://github.com/ledger/ledger
+	shallow = true

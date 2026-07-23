@@ -28,6 +28,9 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@just
+      # The upstream .test parser is pinned against these files, and the tests
+      # reading them skip while the submodule is absent
+      - run: just fetch-upstream
       - run: just check
   acceptance:
     name: acceptance / ${{ matrix.os }}
@@ -67,6 +70,8 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@just
+      - run: just fetch-upstream
       - name: Measure coverage
         run: cargo llvm-cov --branch --workspace --lcov --output-path coverage/lcov.info
       # Codecov stores the coverage % and shields.io renders it from there

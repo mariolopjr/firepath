@@ -517,11 +517,11 @@ fn opening_a_document_with_a_parse_error_publishes_a_diagnostic_at_its_range() {
 
     session.notify_with(
         "textDocument/didOpen",
-        did_open("file:///corpus.ledger", 1, INDENTED),
+        did_open("file:///test.ledger", 1, INDENTED),
     );
 
     let params = published(session.recv());
-    assert_eq!(params.uri.as_str(), "file:///corpus.ledger");
+    assert_eq!(params.uri.as_str(), "file:///test.ledger");
     // The version the client stamped the buffer with, so a client can drop a
     // set a newer edit already superseded
     assert_eq!(params.version, Some(1));

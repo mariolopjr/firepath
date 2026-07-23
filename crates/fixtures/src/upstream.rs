@@ -1,0 +1,603 @@
+//! Parse ledger's `.test` format into the records the upstream harness runs
+//!
+//! A `.test` file is a ledger journal with `test <command>` / `end test` blocks
+//! written into it. ledger runs each block's command against the file itself and
+//! diffs what comes back against the block's body, so the journal under test and
+//! the expectations for it are one file. ledger's parser reads `test`/`end test`
+//! as a comment block, which is why the expectations do not disturb the journal;
+//! firepath's line grouping does the same, so the whole file is the journal input
+//! for both.
+//!
+//! This mirrors `read_test` in the submodule's `test/RegressTests.py`, quirks
+//! included, so the harness measures firepath against what ledger's own runner
+//! does rather than against a tidier reading of the format. The quirks are called
+//! out where they are implemented, and every place this reads the format
+//! differently on purpose is labelled `Deviation`.
+//!
+//! One part of `read_test` is left to the caller: upstream's `transform_line`
+//! substitutes `$sourcepath` and `$FILE` into every expectation line, which 53 of
+//! the checked-out files rely on. Both values depend on where the harness runs, so
+//! they cannot be baked into a parse. Upstream applies the substitution to the
+//! command as well, but only on a command line carrying a ` -> code`, which no
+//! checked-out file does
+
+use std::error::Error;
+use std::fmt;
+use std::mem;
+use std::path::{Path, PathBuf};
+
+/// One `test` block: a command line and what ledger is expected to produce
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Case {
+    /// The command line after `test `, without any ` -> code` suffix
+    pub command: String,
+    /// Expected stdout, `None` when the block carries no body lines
+    ///
+    /// `None` and `Some("")` differ: upstream leaves stdout uncompared when a
+    /// block declares nothing, rather than demanding no output
+    pub output: Option<String>,
+    /// Expected stderr: the body after an `__ERROR__` line, `None` when there is
+    /// none, which upstream reads as expecting stderr to stay empty
+    pub error: Option<String>,
+    /// Expected exit status, 0 unless a ` -> code` declared one
+    ///
+    /// Not necessarily declared by [`command`](Self::command): a `test` line that
+    /// replaces the command carries a code only when it writes one, so a code an
+    /// earlier command declared stays in force
+    pub exit_code: i32,
+}
+
+impl Case {
+    /// Whether the command names its own `-f`, so ledger reads a journal other
+    /// than the `.test` file
+    ///
+    /// Upstream tests for the flag exactly this loosely, then hands ledger the
+    /// test file only when the command does not already name an input
+    pub fn reads_another_journal(&self) -> bool {
+        self.command.contains("-f ")
+    }
+}
+
+/// One parsed `.test` file
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestFile<'a> {
+    /// The journal ledger reads, which is the whole file: the expectation blocks
+    /// inside it parse as comment blocks
+    pub journal: &'a str,
+    /// Every case in the file, in the order they appear
+    pub cases: Vec<Case>,
+    /// Commands that never run: a `test` line opening while a block is already
+    /// open replaces the command rather than starting a case, so the replaced one
+    /// is lost. `regress/C927CFFE.test` carries one. Reported here so a file that
+    /// asserts less than it looks like it does can be seen
+    pub dropped: Vec<String>,
+}
+
+/// Why a `.test` file yielded no records
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Malformed {
+    /// The file holds no bytes. Upstream warns and counts it a failure
+    Empty,
+    /// The file holds no `test` line, so it asserts nothing
+    ///
+    /// Deviation: upstream runs such a file's zero cases and reports nothing,
+    /// which reads as a clean pass. A file that measures nothing is worth seeing
+    NoCases,
+}
+
+impl fmt::Display for Malformed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("the file is empty"),
+            Self::NoCases => f.write_str("the file holds no test block"),
+        }
+    }
+}
+
+impl Error for Malformed {}
+
+/// Parse one `.test` file into the cases it declares
+///
+/// # Errors
+///
+/// Returns [`Malformed`] for a file that declares no case at all, so an input
+/// the harness cannot measure is reported rather than counted as zero failures
+pub fn parse(source: &str) -> Result<TestFile<'_>, Malformed> {
+    if source.is_empty() {
+        return Err(Malformed::Empty);
+    }
+
+    let mut cases = Vec::new();
+    let mut dropped = Vec::new();
+    let mut open: Option<Case> = None;
+    // Sticky across a `test` line, as upstream leaves it, and cleared only when
+    // the block ends
+    let mut in_error = false;
+
+    // Split keeping the terminator: upstream reads with `readline`, so a final
+    // line the file never terminated stays unterminated and its expectation is
+    // one byte shorter than the same text a newline followed
+    for raw in source.split_inclusive('\n') {
+        let (line, terminated) = match raw.strip_suffix('\n') {
+            Some(line) => (line, true),
+            None => (raw, false),
+        };
+        // Python opens the file in universal-newline mode, so a CRLF reaches
+        // `read_test` as a bare LF
+        let line = line.strip_suffix('\r').unwrap_or(line);
+
+        // A `test` line opens a case wherever it lands, an open block included
+        if let Some(rest) = line.strip_prefix("test ") {
+            let (command, exit_code) = split_exit_code(rest);
+            match open.as_mut() {
+                // Upstream overwrites the command in place, keeping any body it
+                // has already collected, so the replaced command never runs
+                Some(case) => {
+                    dropped.push(mem::replace(&mut case.command, command.to_owned()));
+                    // Upstream assigns the exit code only on a line that carries
+                    // one, so a replacement without ` -> code` leaves the code the
+                    // replaced command declared rather than resetting it
+                    if let Some(code) = exit_code {
+                        case.exit_code = code;
+                    }
+                }
+                None => {
+                    open = Some(Case {
+                        command: command.to_owned(),
+                        output: None,
+                        error: None,
+                        exit_code: exit_code.unwrap_or(0),
+                    });
+                }
+            }
+            continue;
+        }
+
+        // A block closes only while one is open: outside a block this is journal
+        // text that happens to read the same way
+        if line.starts_with("end test") {
+            if open.is_some() {
+                cases.extend(open.take());
+                in_error = false;
+            }
+            continue;
+        }
+
+        // Every other line outside a block is journal text as well
+        let Some(case) = open.as_mut() else { continue };
+
+        if !in_error && line.starts_with("__ERROR__") {
+            in_error = true;
+            continue;
+        }
+
+        let body = if in_error {
+            &mut case.error
+        } else {
+            &mut case.output
+        };
+        // The newline goes back on: upstream keeps it on every expectation line
+        // and diffs against process output read the same way
+        let body = body.get_or_insert_default();
+        body.push_str(line);
+        if terminated {
+            body.push('\n');
+        }
+    }
+
+    // A block still open at the end of the file is a case upstream runs anyway,
+    // which `regress/1182_3.test` relies on
+    cases.extend(open);
+
+    if cases.is_empty() {
+        return Err(Malformed::NoCases);
+    }
+    Ok(TestFile {
+        journal: source,
+        cases,
+        dropped,
+    })
+}
+
+/// Split a trailing ` -> code` off a command line, returning the code the line
+/// declares or `None` when it declares none
+///
+/// Upstream matches `(.*) -> ([0-9]+)` with a greedy first group, so the last
+/// ` -> ` followed by a digit is the one that counts and anything after those
+/// digits is dropped. An arrow with no digits after it is part of the command:
+/// `test eval 'x, y -> f(x)'` stays whole.
+///
+/// Deviation: upstream reads the digits as a Python integer of any width, so
+/// `-> 99999999999999999999` is an exit code there and nothing but a test that
+/// can never pass. Here a run of digits no exit status can hold is not a code, so
+/// the search carries on past it and the arrow stays in the command. No
+/// checked-out file declares one
+fn split_exit_code(rest: &str) -> (&str, Option<i32>) {
+    let mut head = rest;
+    while let Some((before, after)) = head.rsplit_once(" -> ") {
+        let end = after
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(after.len());
+        if let Some(digits) = after.get(..end).filter(|digits| !digits.is_empty())
+            && let Ok(code) = digits.parse()
+        {
+            return (before, Some(code));
+        }
+        head = before;
+    }
+    (rest, None)
+}
+
+/// Where the checked-out ledger tests live, holding `baseline` and `regress`
+///
+/// The submodule is optional: the directory is empty until `just fetch-upstream`
+/// checks it out, so a caller reads it expecting it to be absent
+pub fn tests_dir() -> PathBuf {
+    // The crate sits two levels under the repository root, which is where the
+    // submodule is checked out
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../upstream/ledger/test")
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use std::fs;
+
+    use sha2::{Digest, Sha256};
+
+    use super::{Case, Malformed, TestFile, parse, tests_dir};
+
+    // A file's worth of the format, covering a plain block, an error block, and
+    // the journal text the blocks sit in
+    const SAMPLE: &str = "\
+2012-01-01 * Opening
+    Assets:Cash                 10.00 USD
+    Equity:Opening
+
+test bal
+                  10.00 USD  Assets:Cash
+end test
+
+2012-01-02 * Later
+    Assets:Cash                 -1.00 USD
+    Expenses:Food
+
+test -f /dev/null bal broken -> 1
+__ERROR__
+Error: no such file
+end test
+";
+
+    fn parsed(source: &str) -> TestFile<'_> {
+        parse(source).expect("the sample declares cases")
+    }
+
+    // Cases are read by position, and one that is not there is a defect in the
+    // parse rather than in the test
+    fn case<'a>(file: &'a TestFile<'_>, at: usize) -> &'a Case {
+        file.cases.get(at).expect("the file declares this case")
+    }
+
+    #[test]
+    fn a_block_records_its_command_and_body() {
+        let file = parsed(SAMPLE);
+        let first = file.cases.first().expect("the sample opens with a block");
+        assert_eq!(first.command, "bal");
+        assert_eq!(
+            first.output.as_deref(),
+            Some("                  10.00 USD  Assets:Cash\n")
+        );
+        assert_eq!(first.error, None);
+        assert_eq!(first.exit_code, 0);
+    }
+
+    #[test]
+    fn an_error_section_splits_stderr_from_stdout() {
+        let file = parsed(SAMPLE);
+        let second = file.cases.get(1).expect("the sample holds two blocks");
+        assert_eq!(second.command, "-f /dev/null bal broken");
+        assert_eq!(second.exit_code, 1);
+        // Everything after __ERROR__ is stderr, and nothing came before it
+        assert_eq!(second.output, None);
+        assert_eq!(second.error.as_deref(), Some("Error: no such file\n"));
+    }
+
+    #[test]
+    fn the_journal_is_the_whole_file_blocks_included() {
+        let file = parsed(SAMPLE);
+        assert_eq!(file.journal, SAMPLE);
+        assert!(file.dropped.is_empty());
+    }
+
+    #[test]
+    fn a_command_naming_its_own_input_is_flagged() {
+        let file = parsed(SAMPLE);
+        assert!(!case(&file, 0).reads_another_journal());
+        assert!(case(&file, 1).reads_another_journal());
+    }
+
+    #[test]
+    fn a_block_with_no_body_leaves_stdout_uncompared() {
+        let file = parsed("2012-01-01 * A\n\ntest bal\nend test\n");
+        assert_eq!(case(&file, 0).output, None);
+    }
+
+    #[test]
+    fn journal_lines_outside_a_block_are_not_expectations() {
+        let file = parsed("test bal\nout\nend test\n2012-01-01 * A\n    Assets  1 USD\n");
+        assert_eq!(file.cases.len(), 1);
+        assert_eq!(case(&file, 0).output.as_deref(), Some("out\n"));
+    }
+
+    #[test]
+    fn an_arrow_with_no_digits_after_it_stays_in_the_command() {
+        // A value expression, not an exit code, and upstream keeps it whole
+        let file = parsed("test eval 'foo = x, y, z -> print(x, y, z); foo(1, 2, 3)'\nend test\n");
+        assert_eq!(
+            case(&file, 0).command,
+            "eval 'foo = x, y, z -> print(x, y, z); foo(1, 2, 3)'"
+        );
+        assert_eq!(case(&file, 0).exit_code, 0);
+    }
+
+    #[test]
+    fn the_last_arrow_followed_by_digits_is_the_exit_code() {
+        let file = parsed("test eval 'x -> y' -> 14\nend test\n");
+        assert_eq!(case(&file, 0).command, "eval 'x -> y'");
+        assert_eq!(case(&file, 0).exit_code, 14);
+    }
+
+    #[test]
+    fn a_number_too_large_for_an_exit_status_is_not_one() {
+        // The one place the read deviates: upstream takes this as an exit code
+        // no process can return, here it stays part of the command
+        let file = parsed("test bal -> 99999999999999999999\nend test\n");
+        assert_eq!(case(&file, 0).command, "bal -> 99999999999999999999");
+        assert_eq!(case(&file, 0).exit_code, 0);
+    }
+
+    #[test]
+    fn a_replacement_command_without_a_code_keeps_the_one_it_replaced() {
+        // Upstream assigns the exit code only from a line that carries one, so
+        // the replaced command's code outlives the command itself
+        let file = parsed("test bal -> 3\ntest reg\nend test\n");
+        assert_eq!(case(&file, 0).command, "reg");
+        assert_eq!(case(&file, 0).exit_code, 3);
+        // And a replacement that does carry one overwrites it
+        let file = parsed("test bal -> 3\ntest reg -> 5\nend test\n");
+        assert_eq!(case(&file, 0).exit_code, 5);
+    }
+
+    #[test]
+    fn an_error_section_runs_past_a_replacement_command() {
+        // `__ERROR__` is sticky across a `test` line, so the body after the
+        // replacement is still stderr
+        let file = parsed("test a\n__ERROR__\nfirst\ntest b\nsecond\nend test\n");
+        assert_eq!(case(&file, 0).command, "b");
+        assert_eq!(case(&file, 0).output, None);
+        assert_eq!(case(&file, 0).error.as_deref(), Some("first\nsecond\n"));
+    }
+
+    #[test]
+    fn an_error_section_ends_with_its_block() {
+        // The next block starts on stdout again rather than inheriting stderr
+        let file = parsed("test a\n__ERROR__\nboom\nend test\ntest b\nout\nend test\n");
+        assert_eq!(file.cases.len(), 2);
+        assert_eq!(case(&file, 1).output.as_deref(), Some("out\n"));
+        assert_eq!(case(&file, 1).error, None);
+    }
+
+    #[test]
+    fn a_body_line_the_file_never_terminated_keeps_no_newline() {
+        // Upstream's readline hands back the last line as the file holds it, so
+        // an expectation the file cut short expects no trailing newline either
+        let file = parsed("test bal\nout");
+        assert_eq!(case(&file, 0).output.as_deref(), Some("out"));
+    }
+
+    #[test]
+    fn a_crlf_line_ending_reaches_the_body_as_a_bare_newline() {
+        // Python reads in universal-newline mode, which translates before
+        // `read_test` ever sees the line
+        let file = parsed("test bal\r\nout\r\nend test\r\n");
+        assert_eq!(case(&file, 0).command, "bal");
+        assert_eq!(case(&file, 0).output.as_deref(), Some("out\n"));
+    }
+
+    #[test]
+    fn a_block_left_open_at_the_end_of_the_file_still_yields_its_case() {
+        let file = parsed("2012-01-01 * A\n\ntest bal Expenses -> 0\n");
+        assert_eq!(file.cases.len(), 1);
+        assert_eq!(case(&file, 0).command, "bal Expenses");
+        assert_eq!(case(&file, 0).output, None);
+    }
+
+    #[test]
+    fn a_second_test_line_replaces_the_command_and_reports_the_one_it_dropped() {
+        let file = parsed("test reg\ntest -l \"date\" reg\nout\nend test\n");
+        assert_eq!(file.cases.len(), 1);
+        assert_eq!(case(&file, 0).command, "-l \"date\" reg");
+        // The body collected either side of the replacement stays with the case
+        assert_eq!(case(&file, 0).output.as_deref(), Some("out\n"));
+        assert_eq!(file.dropped, vec!["reg".to_owned()]);
+    }
+
+    #[test]
+    fn an_empty_file_is_malformed() {
+        assert_eq!(parse(""), Err(Malformed::Empty));
+        assert_eq!(parse("").unwrap_err().to_string(), "the file is empty");
+    }
+
+    #[test]
+    fn a_file_with_no_block_is_malformed() {
+        let journal = "2012-01-01 * A\n    Assets:Cash   1 USD\n    Equity\n";
+        assert_eq!(parse(journal), Err(Malformed::NoCases));
+        assert_eq!(
+            Malformed::NoCases.to_string(),
+            "the file holds no test block"
+        );
+    }
+
+    #[test]
+    fn a_bare_test_word_does_not_open_a_block() {
+        // Upstream matches on `test ` with the space, so `test` alone is journal
+        assert_eq!(parse("test\nend test\n"), Err(Malformed::NoCases));
+    }
+
+    /// Report that the submodule is not checked out, so a test that proves
+    /// nothing says so rather than passing quietly
+    ///
+    /// CI checks the submodule out, so there the absence is a broken workflow
+    /// rather than a local convenience and the test fails instead of skipping
+    fn skipped_for_missing_submodule(test: &str, path: &std::path::Path) {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "{} is not checked out: CI must run `just fetch-upstream` before the tests",
+            path.display()
+        );
+        eprintln!(
+            "SKIP {test}: {} is not checked out, run `just fetch-upstream`",
+            path.display()
+        );
+    }
+
+    /// What one directory of the checked-out upstream tests parses to
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct Counts {
+        files: usize,
+        cases: usize,
+        nonzero_exit: usize,
+        no_output: usize,
+        with_error: usize,
+        /// sha256 over every field of every case, in path order, so this pins the
+        /// parse byte for byte and not just its shape
+        digest: String,
+    }
+
+    // Digested exactly as the reference implementation is: file name, command,
+    // exit code, then the two bodies with an absent one counting as empty.
+    // Each field ends with a NUL, which no field can hold, so a byte crossing a
+    // field boundary changes the digest rather than moving inside it
+    fn counts_for(dir: &std::path::Path) -> Counts {
+        let mut paths: Vec<_> = fs::read_dir(dir)
+            .expect("the upstream tests directory is readable")
+            .map(|entry| entry.expect("the directory entry is readable").path())
+            .filter(|path| path.extension().is_some_and(|kind| kind == "test"))
+            .collect();
+        paths.sort();
+
+        let mut counts = Counts::default();
+        let mut digest = Sha256::new();
+        for path in &paths {
+            let source = fs::read_to_string(path).expect("every test file is UTF-8");
+            let file = parse(&source)
+                .unwrap_or_else(|err| panic!("{} is malformed: {err}", path.display()));
+            counts.files = counts.files.saturating_add(1);
+            for case in &file.cases {
+                counts.cases = counts.cases.saturating_add(1);
+                counts.nonzero_exit = counts
+                    .nonzero_exit
+                    .saturating_add(usize::from(case.exit_code != 0));
+                counts.no_output = counts
+                    .no_output
+                    .saturating_add(usize::from(case.output.is_none()));
+                counts.with_error = counts
+                    .with_error
+                    .saturating_add(usize::from(case.error.is_some()));
+                for field in [
+                    path.file_name().unwrap_or_default().as_encoded_bytes(),
+                    case.command.as_bytes(),
+                    case.exit_code.to_string().as_bytes(),
+                    case.output.as_deref().unwrap_or_default().as_bytes(),
+                    case.error.as_deref().unwrap_or_default().as_bytes(),
+                ] {
+                    digest.update(field);
+                    digest.update(b"\0");
+                }
+            }
+        }
+        counts.digest = format!("{:x}", digest.finalize());
+        counts
+    }
+
+    #[test]
+    fn the_checked_out_upstream_tests_parses_to_its_pinned_counts() {
+        let dir = tests_dir();
+        if !dir.join("baseline").is_dir() {
+            skipped_for_missing_submodule(
+                "the_checked_out_upstream_tests_parses_to_its_pinned_counts",
+                &dir,
+            );
+            return;
+        }
+
+        // Pinned against ledger v3.4.1. The digests were taken from upstream's
+        // own read_test run over the same files, so they pin agreement with the
+        // reference implementation and not merely against a previous run of this
+        // parser. Bumping the submodule moves them, which is why that bump is a
+        // decision and not a chore.
+        //
+        // Every `.test` file counts, the ten `_py.test` ones included, which
+        // upstream's runner skips unless it was built with Python. What they parse
+        // to is pinned all the same, and whether to run them is the harness's call
+        assert_eq!(
+            counts_for(&dir.join("baseline")),
+            Counts {
+                files: 216,
+                cases: 422,
+                nonzero_exit: 13,
+                no_output: 19,
+                with_error: 23,
+                digest: "f29cf66bb5b547e44772c5fe454aecd15ee5bdc90ce05da7463250c89423eaa4".into(),
+            }
+        );
+        assert_eq!(
+            counts_for(&dir.join("regress")),
+            Counts {
+                files: 219,
+                cases: 352,
+                nonzero_exit: 33,
+                no_output: 54,
+                with_error: 36,
+                digest: "669c3ceee1fbd62528467a61fefd78021f8bc50b1e0a49fb4ca2fb30e34df0ca".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn the_upstream_tests_carries_one_known_dropped_command() {
+        let path = tests_dir().join("regress").join("C927CFFE.test");
+        let Ok(source) = fs::read_to_string(&path) else {
+            skipped_for_missing_submodule(
+                "the_upstream_tests_carries_one_known_dropped_command",
+                &path,
+            );
+            return;
+        };
+        // A stray `test reg` on the line above the real command, in ledger's own
+        // upstream tests. Upstream runs five cases here and never reports the sixth
+        let file = parsed(&source);
+        assert_eq!(file.cases.len(), 5);
+        assert_eq!(file.dropped, vec!["reg".to_owned()]);
+    }
+
+    #[test]
+    fn the_upstream_tests_carries_one_block_the_file_never_closes() {
+        let path = tests_dir().join("regress").join("1182_3.test");
+        let Ok(source) = fs::read_to_string(&path) else {
+            skipped_for_missing_submodule(
+                "the_upstream_tests_carries_one_block_the_file_never_closes",
+                &path,
+            );
+            return;
+        };
+        // The only file whose last `test` line has no `end test` after it, so
+        // dropping an unclosed block would silently cost a case
+        let file = parsed(&source);
+        assert_eq!(file.cases.len(), 1);
+        assert_eq!(case(&file, 0).command, "bal Expenses:Cookies");
+        assert_eq!(case(&file, 0).output, None);
+    }
+}

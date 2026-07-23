@@ -12,6 +12,7 @@ mod banking;
 mod household;
 pub mod manifest;
 mod rng;
+pub mod upstream;
 
 use std::collections::BTreeMap;
 use std::error::Error;
