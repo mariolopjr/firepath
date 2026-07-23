@@ -11,8 +11,10 @@
 //! what the ledger tree-sitter grammar uses for the same constructs.
 //!
 //! The buffer is grouped into blocks again here rather than carried over from
-//! the diagnostics pass: [`parse`](firepath_ledger::parse) returns errors, not
-//! items, so there is nothing to reuse yet.
+//! the diagnostics pass. Highlighting colors every block kind, comment and
+//! directive lines included, while [`parse`](firepath_ledger::parse) keeps only
+//! transactions, so the block grouping is the level with what this needs and the
+//! transactions the parse returns are not enough to reuse.
 //!
 //! A block that does not scan contributes no tokens. Its diagnostic already
 //! says what is wrong, and a half-scanned line has no spans to color. The one

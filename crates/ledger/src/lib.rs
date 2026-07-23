@@ -34,8 +34,14 @@
 //! yet.
 //!
 //! [`parse`] ties them together: it groups a whole file with [`blocks`] and
-//! dispatches each block to its scanner. At the moment only returns any errors
-//! encountered.
+//! dispatches each block to its scanner, returning a [`Parsed<Transaction>`]:
+//! every transaction it read paired with the postings under it, alongside every
+//! error. A [`Transaction`] is what the writer, the balancer, and the queries
+//! read, so the file is parsed once.
+//!
+//! [`write_transaction`] goes the other way: it formats a [`Transaction`] back
+//! to ledger's `print` shape, dates normalized and amounts aligned, the byte
+//! path the `print` command emits through.
 
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
@@ -49,6 +55,7 @@ mod posting;
 mod scan;
 mod span;
 mod transaction;
+mod write;
 
 pub use amount::{Amount, Commodity, DecimalStyle, Placement, SymbolError};
 pub use date::{Date, Separator};
@@ -58,7 +65,8 @@ pub use lines::{Block, BlockKind, blocks};
 pub use parse::parse;
 pub use posting::{Posting, PostingKind};
 pub use span::{FileId, Span, clamp_u32};
-pub use transaction::{Status, TransactionHeader};
+pub use transaction::{Status, Transaction, TransactionHeader};
+pub use write::{write_transaction, write_transactions};
 
 /// The result of parsing one source file: the items parsed plus every error
 ///

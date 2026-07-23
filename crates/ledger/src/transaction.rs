@@ -6,11 +6,31 @@
 //! payee.
 //!
 //! A trailing `;` comment is not split off yet
+//!
+//! A [`Transaction`] pairs a parsed header with the postings under it, the whole
+//! block after [`parse`](crate::parse) has scanned it
 
 use crate::date::Date;
 use crate::error::ParseError;
+use crate::posting::Posting;
 use crate::scan::{skip_ws, span_at, trim_end, widen_empty};
 use crate::span::{Span, clamp_u32};
+
+/// A whole transaction: its header and the postings under it
+///
+/// This is what [`parse`](crate::parse) keeps for each transaction block, the
+/// header and postings that used to be scanned only to be dropped. A transaction
+/// exists only when its header scanned, since without a date there is nothing to
+/// date, balance, or print. Its postings are the ones that scanned, so a block
+/// whose header is good but whose posting is malformed still yields a
+/// transaction, with the bad posting absent and its error recorded separately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transaction {
+    /// The header line's parsed parts: date, status, code, payee
+    pub header: TransactionHeader,
+    /// The postings under the header, in source order, each one that scanned
+    pub postings: Vec<Posting>,
+}
 
 /// The clearing status a header carries between the date and the payee
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

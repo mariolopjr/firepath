@@ -588,7 +588,7 @@ pub fn measure(dir: &Path, firepath: &Path) -> io::Result<Report> {
         // with `-f`, and both parsers take the expectation blocks as comments.
         // The id only tags errors for rendering
         let id = FileId::new(u32::try_from(index).unwrap_or(u32::MAX));
-        for error in parse_journal(id, source.as_bytes()) {
+        for error in parse_journal(id, source.as_bytes()).errors {
             bump(&mut report.grammar, error.message);
         }
 

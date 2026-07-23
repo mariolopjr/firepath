@@ -34,8 +34,10 @@ pub(crate) fn run(path: &Path) -> ExitCode {
         }
     };
 
-    // A single file, so it needs only the one handle
-    let errors = parse(FileId::new(0), &source);
+    // A single file, so it needs only the one handle. Only the errors are read
+    // here: `check` reports problems and says nothing about a clean file, so the
+    // transactions the parse also returns go unused
+    let errors = parse(FileId::new(0), &source).errors;
     if errors.is_empty() {
         return ExitCode::SUCCESS;
     }

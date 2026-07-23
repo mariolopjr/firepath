@@ -55,7 +55,8 @@ impl Document {
     /// A buffer from the client is always a `String`
     fn from_bytes(version: i32, text: Vec<u8>) -> Self {
         Self {
-            errors: parse(SOLE_FILE, &text),
+            // Only the errors go to diagnostics for now
+            errors: parse(SOLE_FILE, &text).errors,
             line_starts: line_starts(&text),
             version,
             text,

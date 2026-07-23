@@ -559,31 +559,49 @@ impl<'a> Scanner<'a> {
 
 /// Whether a byte can appear in a bare, unquoted commodity symbol
 ///
-/// A bare symbol ends at whitespace, an ASCII control byte, a digit, or a
-/// character the amount grammar gives its own meaning (sign, dot, comma, quote,
-/// cost `@`, comment `;`, assertion `=`, the multiplier `*`, and the brackets
-/// around virtual postings and lot prices). A non-ascii byte is always part of
-/// the symbol
+/// The set of bytes that end a bare symbol is ledger's own `invalid_chars` table
+/// (`src/commodity.cc`): whitespace, a digit, and the punctuation the amount and
+/// expression grammars claim, which is
+/// `! & ( ) * + , - . / : ; < = > ? @ [ ] ^ { | } ~`. A symbol holding any of
+/// these must be quoted, and unquoted it ends at the first one, both matching
+/// ledger so a commodity reads and writes the same way it does there.
+///
+/// Two bytes are stricter here than in ledger's table, which marks them valid:
+/// an ASCII control byte and a `"`. firepath refuses a symbol holding either at
+/// construction, since neither can be written to a single-line journal and read
+/// back, so treating them as symbol-ending keeps the parser from building one
+/// the constructor would only reject. A non-ascii byte is always part of the
+/// symbol
 fn is_commodity_byte(b: u8) -> bool {
     !(b.is_ascii_whitespace()
         || b.is_ascii_control()
         || b.is_ascii_digit()
         || matches!(
             b,
-            b'-' | b'+'
-                | b'.'
-                | b','
-                | b'"'
-                | b'@'
-                | b';'
-                | b'='
-                | b'*'
+            b'!' | b'"'
+                | b'&'
                 | b'('
                 | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b'-'
+                | b'.'
+                | b'/'
+                | b':'
+                | b';'
+                | b'<'
+                | b'='
+                | b'>'
+                | b'?'
+                | b'@'
                 | b'['
                 | b']'
+                | b'^'
                 | b'{'
+                | b'|'
                 | b'}'
+                | b'~'
         ))
 }
 
@@ -765,6 +783,28 @@ mod tests {
                 String::from_utf8_lossy(src)
             );
         }
+    }
+
+    #[test]
+    fn a_symbol_with_a_grammar_character_reads_and_writes_the_way_ledger_does() {
+        // ledger's `invalid_chars` table ends a bare symbol at any of these, so
+        // a symbol holding one has to be quoted and comes back quoted. `M&M`
+        // from ledger's own `regress/A28CF697.test` is the case that drove this
+        for symbol in ["M&M", "a/b", "x:y", "p?q", "u^v", "m|n", "t~s", "z!w"] {
+            let quoted = format!("1 \"{symbol}\"");
+            let amount = Amount::parse(quoted.as_bytes()).unwrap();
+            assert_eq!(amount.commodity.symbol(), symbol.as_bytes());
+            assert_eq!(
+                written(&amount),
+                quoted.as_bytes(),
+                "round-trip of {symbol:?}"
+            );
+        }
+
+        // Unquoted, the symbol ends at the grammar character, so the rest is
+        // leftover the amount scanner refuses, the same boundary ledger draws
+        let err = Amount::parse(b"1 M&M").unwrap_err();
+        assert_eq!(err.message, "unexpected characters after the amount");
     }
 
     #[test]
