@@ -82,3 +82,98 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage/lcov.info
           fail_ci_if_error: true
+  conformance:
+    name: conformance
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # To leave the conformance comment on a PR
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+      GIST_ID: ${{ vars.CONFORMANCE_GIST_ID }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@just
+      - run: just fetch-upstream
+      # Runs firepath against every upstream case and renders the shields
+      # endpoint
+      - name: Measure conformance
+        run: just conformance-badge | tee badge.json
+      - name: Publish the badge to the gist
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        # `--rawfile` embeds the endpoint JSON as the file content with jq doing
+        # the escaping. `gh api` reads the PATCH body from stdin
+        run: |
+          jq -n --rawfile badge badge.json \
+            '{files: {"firepath-conformance.json": {content: $badge}}}' \
+            | gh api -X PATCH "/gists/$GIST_ID" --input -
+      # On a PR, compare this branch's conformance against what main last
+      # published and comment on conformance %
+      - name: Comment when conformance drops
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@v7
+        env:
+          GIST_ID: ${{ vars.CONFORMANCE_GIST_ID }}
+        with:
+          script: |
+            const fs = require('fs');
+
+            const fraction = (msg) => {
+              const m = /^(\d+)\/(\d+)/.exec(String(msg));
+              if (!m) throw new Error(`unreadable badge message: ${msg}`);
+              return [Number(m[1]), Number(m[2])];
+            };
+
+            const current = JSON.parse(fs.readFileSync('badge.json', 'utf8'));
+            const [curPass, curTotal] = fraction(current.message);
+
+            // Baseline is what main last published to the badge gist. With no
+            // gist there is nothing to compare against, so there is nothing to say
+            const gistId = process.env.GIST_ID;
+            if (!gistId) { core.info('no CONFORMANCE_GIST_ID set, skipping'); return; }
+
+            let baseline;
+            try {
+              const url = `https://gist.githubusercontent.com/${context.repo.owner}/${gistId}/raw/firepath-conformance.json`;
+              const res = await fetch(url);
+              if (!res.ok) throw new Error(`gist responded ${res.status}`);
+              const payload = JSON.parse(await res.text());
+              baseline = { message: payload.message, counts: fraction(payload.message) };
+            } catch (err) {
+              core.info(`no conformance baseline to compare against: ${err}`);
+              return;
+            }
+            const [basePass, baseTotal] = baseline.counts;
+
+            // Compared as fractions, so a change in the denominator is not read as
+            // a regression on its own
+            const curPct = curTotal ? curPass / curTotal : 0;
+            const basePct = baseTotal ? basePass / baseTotal : 0;
+            const dropped = curPct < basePct;
+
+            // Quoting the badge messages whole, so the percentage in the comment
+            // is the one the badge renders rather than a second rounding done here
+            const marker = '<!-- conformance-report -->';
+            const body = dropped
+              ? `${marker}\n### ⚠️ Conformance dropped\n\n`
+                + `\`main\` conforms to \`${baseline.message}\`; this branch conforms to \`${current.message}\`.\n\n`
+                + `Not a hard failure, but a case that used to pass no longer does. `
+                + `If that is intended, note it in the PR; otherwise it is a regression to fix.`
+              : `${marker}\n### ✅ Conformance holds\n\n`
+                + `This branch conforms to \`${current.message}\`, no drop from \`main\`'s \`${baseline.message}\`.`;
+
+            // One sticky comment, updated in place
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const existing = comments.find((c) => c.body.includes(marker));
+            if (!dropped && !existing) { core.info('conformance held, no prior comment, nothing to post'); return; }
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }

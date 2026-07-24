@@ -2,6 +2,7 @@
 
 [![Build](https://img.shields.io/github/actions/workflow/status/mariolopjr/firepath/ci.yml?branch=main&style=for-the-badge)](https://github.com/mariolopjr/firepath/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/codecov/c/github/mariolopjr/firepath/main?style=for-the-badge)](https://codecov.io/gh/mariolopjr/firepath)
+[![Ledger Conformance](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/mariolopjr/97f89c3e0f1234a39f0cc1daae82632f/raw/firepath-conformance.json&style=for-the-badge)](https://github.com/mariolopjr/firepath/actions/workflows/ci.yml)
 
 firepath reads a native [ledger][ledger] journal and turns it into tax-aware retirement analysis: deterministic
 projection, [Monte Carlo][monte-carlo], [historical backtest][backtest], [Roth conversion][roth]

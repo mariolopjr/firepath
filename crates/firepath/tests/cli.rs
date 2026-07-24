@@ -46,7 +46,141 @@ fn help_flag_lists_the_subcommands() {
     // Every subcommand that works is advertised under a Commands section
     assert!(stdout.contains("Commands:"));
     assert!(stdout.contains("check"));
+    assert!(stdout.contains("print"));
     assert!(stdout.contains("lsp"));
+}
+
+// The A28CF697 regression journal and the exact bytes `ledger print` emits for
+// it, the first upstream case firepath conforms to. The input dates are dashed
+// and its amount over-indented. The output is dates normalized to slashes, the
+// account left-justified to the 36-column floor, and the commodity re-quoted
+// because `&` is not a bare-commodity byte
+const MODEL_INPUT: &[u8] = b"2010-02-05 * Flight SN2094\n    Assets:Rewards:Airmiles                        125 \"M&M\"\n    Income:Rewards\n";
+const MODEL_OUTPUT: &str = "2010/02/05 * Flight SN2094\n    Assets:Rewards:Airmiles                125 \"M&M\"\n    Income:Rewards\n";
+
+// Run `print` with the journal fed on stdin, the way the harness drives `-f -`.
+// Returns the finished output after stdin is closed
+fn print_stdin(args: &[&str], input: &[u8]) -> std::process::Output {
+    let mut child = firepath()
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run firepath");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input)
+        .expect("write the journal to stdin");
+    child.wait_with_output().expect("firepath exited")
+}
+
+#[test]
+fn print_emits_the_canonical_form_of_the_model_case() {
+    // The global flags are passed in the harness's own order, before the
+    // command, so this locks that invocation shape as much as the output
+    let journal = temp_journal(MODEL_INPUT);
+    let output = firepath()
+        .args(["--args-only", "--columns=80", "-f"])
+        .arg(journal.path())
+        .arg("print")
+        .output()
+        .expect("run firepath");
+
+    assert_eq!(output.status.code(), Some(0), "stderr: {:?}", output.stderr);
+    assert!(output.stderr.is_empty());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), MODEL_OUTPUT);
+}
+
+#[test]
+fn print_reads_the_journal_from_stdin_with_dash_f() {
+    let output = print_stdin(&["-f", "-", "print"], MODEL_INPUT);
+
+    assert_eq!(output.status.code(), Some(0), "stderr: {:?}", output.stderr);
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), MODEL_OUTPUT);
+}
+
+#[test]
+fn print_reads_stdin_when_no_file_is_given() {
+    // No `-f` at all falls back to standard input, so a piped journal still
+    // prints. This is the arm the harness never takes but a shell pipe does
+    let output = print_stdin(&["print"], MODEL_INPUT);
+
+    assert_eq!(output.status.code(), Some(0), "stderr: {:?}", output.stderr);
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), MODEL_OUTPUT);
+}
+
+#[test]
+fn print_output_is_idempotent() {
+    // Canonical form is a fixed point: printing already-canonical output leaves
+    // it byte for byte unchanged. Proves the round trip end to end without a
+    // hand-counted expectation
+    let once = print_stdin(&["print"], MODEL_INPUT);
+    assert_eq!(once.status.code(), Some(0));
+    let twice = print_stdin(&["print"], &once.stdout);
+    assert_eq!(twice.stdout, once.stdout);
+}
+
+#[test]
+fn print_on_a_parse_error_writes_stderr_and_exits_one_with_no_stdout() {
+    // A parse error stops the whole print the way ledger does: the error goes
+    // to stderr with its location, stdout stays empty, and the exit code is the
+    // one `check` uses for a file that had errors, distinct from an unreadable
+    // file
+    let journal = temp_journal(b"2020-13-01 Grocery\n    Expenses:Food    $5.00\n");
+    let output = firepath()
+        .arg("-f")
+        .arg(journal.path())
+        .arg("print")
+        .output()
+        .expect("run firepath");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        output.stdout.is_empty(),
+        "nothing is printed on a bad parse"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains(":1:1: 2020-13-01 is not a real calendar date"),
+        "got {stderr:?}"
+    );
+}
+
+#[test]
+fn print_on_an_unreadable_file_exits_three() {
+    // A missing `-f` target is a read failure, exit 3, the same split `check`
+    // draws between an unreadable file and a parse failure
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("missing.ledger");
+    let output = firepath()
+        .arg("-f")
+        .arg(&missing)
+        .arg("print")
+        .output()
+        .expect("run firepath");
+
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("cannot read"), "reports the read failure");
+}
+
+#[test]
+fn print_rejects_a_ledger_flag_it_does_not_model_without_crashing() {
+    // A `print` flag firepath has no meaning for yet is a clap usage error, exit
+    // 2, not a panic. The out-of-scope upstream cases fail this way rather than
+    // producing wrong output
+    let journal = temp_journal(MODEL_INPUT);
+    let output = firepath()
+        .arg("-f")
+        .arg(journal.path())
+        .args(["print", "--decimal-comma"])
+        .output()
+        .expect("run firepath");
+
+    assert_eq!(output.status.code(), Some(2));
 }
 
 #[test]

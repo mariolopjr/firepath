@@ -53,6 +53,12 @@ fetch-upstream:
 conformance-upstream: build
   cargo run --quiet --package firepath-fixtures --bin conformance-upstream
 
+# Print the conformance badge as a shields.io endpoint, the JSON CI pushes to the
+# gist the README badge reads from
+# Needs the submodule, so run `just fetch-upstream` first
+conformance-badge: build
+  cargo run --quiet --package firepath-fixtures --bin conformance-upstream -- --badge
+
 # Audit dependencies for advisories, licenses, duplicates, and sources
 deny:
   cargo deny check

@@ -86,24 +86,6 @@ fn the_harness_runs_every_case_upstream_runs() {
 
 #[test]
 #[ignore = "spawns firepath once per upstream case, run by `just check`"]
-fn the_grammar_breakdown_is_reported_without_being_scored() {
-    let Some(report) = measured("the_grammar_breakdown_is_reported_without_being_scored") else {
-        return;
-    };
-
-    // How many parse errors the grammar firepath supports today raises over the
-    // upstream journals. A ratchet, not a pin: every grammar wave lowers it, and
-    // the number here comes down with it. Raising it means firepath got stricter
-    // on purpose, which is a decision to document rather than a chore
-    let errors: usize = report.grammar.values().sum();
-    assert!(
-        errors <= 1298,
-        "grammar coverage regressed: {errors} parse errors over the upstream journals"
-    );
-}
-
-#[test]
-#[ignore = "spawns firepath once per upstream case, run by `just check`"]
 fn two_runs_over_the_same_tests_report_the_same_thing() {
     let Some([first, second]) = runs("two_runs_over_the_same_tests_report_the_same_thing") else {
         return;

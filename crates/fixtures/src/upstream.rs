@@ -373,6 +373,45 @@ impl Report {
             malformed: &self.malformed,
         })
     }
+
+    /// Render the report as a shields.io endpoint badge, `ledger compat N/M (P%)`
+    ///
+    /// The shape is shields' [endpoint schema]: a static object a badge URL
+    /// reads and renders. Color comes from [`Report::badge_color`].
+    ///
+    /// Anything reading the message back must parse the leading fraction and
+    /// ignore the rest, which is what the PR comparison in CI does
+    ///
+    /// [endpoint schema]: https://shields.io/badges/endpoint-badge
+    ///
+    /// # Errors
+    ///
+    /// Fails only if the endpoint cannot be serialized, which a struct of a
+    /// number and three strings cannot do
+    pub fn badge_endpoint(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(&Endpoint {
+            schema_version: 1,
+            label: "ledger compat",
+            message: format!("{}/{} ({}%)", self.passing, self.cases, self.conformance()),
+            color: self.badge_color(),
+        })
+    }
+
+    /// The shields color the badge displays, from the conformance percentage
+    ///
+    /// A six-band ramp red through brightgreen, so the badge reddens on a low
+    /// number and greens as firepath closes the gap. Full parity is the only
+    /// brightgreen
+    fn badge_color(&self) -> &'static str {
+        match self.conformance() {
+            pct if pct >= 100.0 => "brightgreen",
+            pct if pct >= 90.0 => "green",
+            pct if pct >= 75.0 => "yellowgreen",
+            pct if pct >= 50.0 => "yellow",
+            pct if pct >= 25.0 => "orange",
+            _ => "red",
+        }
+    }
 }
 
 /// The report's wire shape, with the derived percentage alongside the counts it
@@ -391,6 +430,20 @@ struct Json<'a> {
     failures: &'a BTreeMap<String, usize>,
     grammar: &'a BTreeMap<String, usize>,
     malformed: &'a BTreeMap<String, usize>,
+}
+
+/// The shields.io endpoint badge wire shape
+///
+/// `schemaVersion` is the field shields keys on to read the rest, and it is `1`
+/// for every badge this produces. The renamed field is the one camelCase name
+/// shields requires
+#[derive(Debug, serde::Serialize)]
+struct Endpoint<'a> {
+    #[serde(rename = "schemaVersion")]
+    schema_version: u8,
+    label: &'a str,
+    message: String,
+    color: &'a str,
 }
 
 /// A count as a percentage of a total, rounded to two places, and zero when
@@ -690,7 +743,7 @@ pub fn firepath_binary() -> Option<PathBuf> {
 /// Reports a missing input rather than measuring zero cases against it: a run
 /// that found no tests and a run that satisfied none of them both print a zero,
 /// and only one of them is a firepath result
-fn report_json(dir: &Path, firepath: Option<&Path>) -> Result<String, String> {
+fn measured_report(dir: &Path, firepath: Option<&Path>) -> Result<Report, String> {
     if !dir.is_dir() {
         return Err(format!(
             "{} is not checked out, run `just fetch-upstream`",
@@ -700,17 +753,41 @@ fn report_json(dir: &Path, firepath: Option<&Path>) -> Result<String, String> {
     let Some(firepath) = firepath else {
         return Err("no firepath binary next to this one, run `just build`".to_owned());
     };
-    measure(dir, firepath)
-        .map_err(|err| err.to_string())?
+    measure(dir, firepath).map_err(|err| err.to_string())
+}
+
+/// The full report as JSON, or why the run cannot happen
+fn report_json(dir: &Path, firepath: Option<&Path>) -> Result<String, String> {
+    measured_report(dir, firepath)?
         .to_json()
         .map_err(|err| format!("the report will not serialize: {err}"))
 }
 
+/// The conformance badge as a shields.io endpoint
+///
+/// Shares [`measured_report`] with [`report_json`]
+fn badge_json(dir: &Path, firepath: Option<&Path>) -> Result<String, String> {
+    measured_report(dir, firepath)?
+        .badge_endpoint()
+        .map_err(|err| format!("the badge will not serialize: {err}"))
+}
+
 /// The whole body of the `conformance-upstream` command: run the checked-out
-/// tests and print the report as JSON
+/// tests and print either the full report or the badge endpoint as JSON
+///
+/// `--badge` prints the shields.io endpoint the CI badge reads. Without it the
+/// full report prints
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub fn cli() -> ExitCode {
-    match report_json(&tests_dir(), firepath_binary().as_deref()) {
+    let badge = env::args().nth(1).as_deref() == Some("--badge");
+    let dir = tests_dir();
+    let firepath = firepath_binary();
+    let rendered = if badge {
+        badge_json(&dir, firepath.as_deref())
+    } else {
+        report_json(&dir, firepath.as_deref())
+    };
+    match rendered {
         Ok(json) => {
             println!("{json}");
             ExitCode::SUCCESS
@@ -732,8 +809,9 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        Case, Malformed, Path, PathBuf, TestFile, command_word, firepath_binary, measure, parse,
-        percent, reads_stdin, report_json, shell_quote, test_files, tests_dir, transform,
+        Case, Malformed, Path, PathBuf, Report, TestFile, badge_json, command_word,
+        firepath_binary, measure, parse, percent, reads_stdin, report_json, shell_quote,
+        test_files, tests_dir, transform,
     };
     use std::fmt::Write as _;
 
@@ -1511,6 +1589,88 @@ end test
 
         let json = report_json(dir.path(), Some(&bin)).expect("the run completes");
         assert!(json.contains("\"cases\": 2"), "{json}");
+    }
+
+    #[test]
+    fn the_badge_color_climbs_from_red_to_bright_green() {
+        // Every band boundary, and the value just under it, so the ramp cannot
+        // slide a threshold without a test noticing
+        let color = |passing, cases| {
+            Report {
+                cases,
+                passing,
+                ..Report::default()
+            }
+            .badge_color()
+        };
+        assert_eq!(color(0, 775), "red");
+        assert_eq!(color(24, 100), "red");
+        assert_eq!(color(25, 100), "orange");
+        assert_eq!(color(49, 100), "orange");
+        assert_eq!(color(50, 100), "yellow");
+        assert_eq!(color(74, 100), "yellow");
+        assert_eq!(color(75, 100), "yellowgreen");
+        assert_eq!(color(89, 100), "yellowgreen");
+        assert_eq!(color(90, 100), "green");
+        assert_eq!(color(99, 100), "green");
+        assert_eq!(color(100, 100), "brightgreen");
+    }
+
+    #[test]
+    fn the_badge_endpoint_is_a_shields_object() {
+        // Compact JSON, so the field separators are bare colons. The message is
+        // the fraction followed by the percentage it works out to
+        let badge = Report {
+            cases: 775,
+            passing: 3,
+            ..Report::default()
+        }
+        .badge_endpoint()
+        .expect("the badge serializes");
+        assert!(badge.contains("\"schemaVersion\":1"), "{badge}");
+        assert!(badge.contains("\"label\":\"ledger compat\""), "{badge}");
+        assert!(badge.contains("\"message\":\"3/775 (0.39%)\""), "{badge}");
+        assert!(badge.contains("\"color\":\"red\""), "{badge}");
+
+        // Full parity drops the trailing zeros, so the badge reads `100%`
+        // rather than `100.00%`
+        let full = Report {
+            cases: 775,
+            passing: 775,
+            ..Report::default()
+        }
+        .badge_endpoint()
+        .expect("the badge serializes");
+        assert!(full.contains("\"message\":\"775/775 (100%)\""), "{full}");
+        assert!(full.contains("\"color\":\"brightgreen\""), "{full}");
+
+        // Nothing to divide by is 0%, never the NaN a bare division would put
+        // in the message
+        let empty = Report::default()
+            .badge_endpoint()
+            .expect("the badge serializes");
+        assert!(empty.contains("\"message\":\"0/0 (0%)\""), "{empty}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_badge_command_measures_before_it_paints() {
+        let dir = tests_in(&[("clean.test", SAMPLE)]);
+        let bin = stub(dir.path(), "exit 0");
+
+        // The badge shares the report's guard: a run that cannot happen is an
+        // error, never a zero-case badge that would read as a firepath result
+        let absent = dir.path().join("no-such-directory");
+        let err = badge_json(&absent, Some(&bin)).expect_err("the directory is not there");
+        assert!(
+            err.ends_with("is not checked out, run `just fetch-upstream`"),
+            "{err}"
+        );
+
+        // A real measurement paints a shields object over the cases it ran
+        let badge = badge_json(dir.path(), Some(&bin)).expect("the run completes");
+        assert!(badge.contains("\"schemaVersion\":1"), "{badge}");
+        assert!(badge.contains("\"label\":\"ledger compat\""), "{badge}");
     }
 
     #[cfg(unix)]
